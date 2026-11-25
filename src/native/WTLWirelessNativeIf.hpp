@@ -14,6 +14,9 @@
 // Shape adapted from ga403wm-hackintosh kexts/itlmt7925Native/itlmt7925_iface.{h,cpp} (BSD-3-Clause-Clear, Copyright (c)
 // 2026 thanhnndev and contributors), re-read against the 25G241 dump.
 #pragma once
+#ifndef MTK_NATIVE_ABI_MAJOR
+#define MTK_NATIVE_ABI_MAJOR 25
+#endif
 #include "IO80211InfraProtocol.h"
 #include "MtkCoreApi.h"
 #include "skywalk_min.h"
@@ -27,6 +30,8 @@ class WTLWirelessNativeIf : public IO80211InfraProtocol {
 
 public:
     static const uint32_t kNumTx = 4;        // Apple's interface fixes four Tx submission queues (ACs 0..3)
+    static const uint32_t kBeaconHeader = MTK_NATIVE_ABI_MAJOR < 25 ? 0x40u : 0x44u;
+    static const uint32_t kLqmSize = MTK_NATIVE_ABI_MAJOR < 25 ? 0x150u : 0x1dcu;
 
     // alloc, init(), the station address, role and id, attach(controller). Not started yet.
     static WTLWirelessNativeIf *withController(WTLWirelessNative *controller, uint32_t ifId, uint32_t role);
@@ -118,7 +123,7 @@ private:
     uint8_t scanSsid[32] = {};
     struct mtk_bss_info *bssSnap = nullptr;  // kBssSnap entries, filled under the core gate
     uint8_t *beaconMsg = nullptr;            // kBeaconHeader + MTK_BSS_IE_MAX
-    static const uint32_t kBssSnap = 128, kBeaconHeader = 0x44, kScanTimeoutPolls = 2500;   // 25 s at the 10 ms poll
+    static const uint32_t kBssSnap = 128, kScanTimeoutPolls = 2500;   // 25 s at the 10 ms poll
     void serviceScan();
     void deliverScanResults();
     void postEvent(uint32_t code, void *data, unsigned long length);
@@ -136,8 +141,10 @@ private:
     uint32_t joinPolls = 0, reannouncePolls = 0;
     uint32_t joinsRequested = 0, joinsOk = 0, joinsFailed = 0, leaves = 0, linkDowns = 0;
     uint32_t beaconReports = 0;              // 0xaf events posted (the Family's missed-beacons check)
-    uint8_t *lqmMsg = nullptr;               // 0x1dc bytes, the 0x27 link quality update posted with each beacon report
+    uint8_t *lqmMsg = nullptr;               // kLqmSize bytes, the 0x27 link quality update posted with each beacon report
+#if MTK_NATIVE_ABI_MAJOR >= 25
     uint32_t lqmTick = 0;
+#endif
     int32_t lqReported = -3;               // last ifnet link quality given to setLQM; -3 = never
     void reportLinkQuality(int32_t lq);
     uint32_t assocTraced = 0, linkStatusTraced = 0, linkStateTraced = 0, bssInfoTraced = 0, extBssTraced = 0, miscTraced = 0;
@@ -152,9 +159,11 @@ private:
     static IOReturn gatedDisconnect(OSObject *owner, void *, void *, void *, void *);
     static IOReturn gatedStatus(OSObject *owner, void *, void *, void *, void *);
     static IOReturn gatedFindBss(OSObject *owner, void *bssid, void *found, void *, void *);
+#if MTK_NATIVE_ABI_MAJOR >= 25
 public:
     IOReturn setWCL_LINK_STATE_UPDATE(apple80211_wcl_update_link_state *a1) override;   // IO80211InfraInterface slot 468
 private:
+#endif
     IOWorkLoop *coreLoop = nullptr;          // retained
     IOWorkLoop *queued = nullptr;            // the work queue the event sources were added to (retained)
     IOSkywalkPacketBufferPool *pool = nullptr;

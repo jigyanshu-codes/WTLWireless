@@ -16,7 +16,9 @@ FW = Path(__file__).resolve().parents[1] / "firmware"
 BLOBS = [("mtk_fw_patch", "mt7925", "WIFI_MT7925_PATCH_MCU_1_1_hdr.bin"),
          ("mtk_fw_ram", "mt7925", "WIFI_RAM_CODE_MT7925_1_1.bin"),
          ("mtk_fw_patch_7927", "mt7927", "WIFI_MT6639_PATCH_MCU_2_1_hdr.bin"),
-         ("mtk_fw_ram_7927", "mt7927", "WIFI_RAM_CODE_MT6639_2_1.bin")]
+         ("mtk_fw_ram_7927", "mt7927", "WIFI_RAM_CODE_MT6639_2_1.bin"),
+         ("mtk_fw_patch_7902", "mt7902", "WIFI_MT7902_patch_mcu_1_1_hdr.bin"),
+         ("mtk_fw_ram_7902", "mt7902", "WIFI_RAM_CODE_MT7902_1.bin")]
 
 
 def pinned(chip):

@@ -234,9 +234,9 @@ bool WTLWireless::start(IOService *provider) {
 
     // some MT7927 boards report another CHIPID word (mt7925_pci_probe forces the chip); only the known ones are taken
     uint16_t idLow = chipId & 0xffff;
-    bool idOk = idLow == chip->id;
+    bool idOk = idLow == chip->id || (chipId >> 16) == chip->id;
     for (uint8_t i = 0; !idOk && i < chip->nChipIdAlt; i++) idOk = idLow == chip->chipIdAlt[i];
-    if (idOk && idLow != chip->id) {
+    if (idOk && idLow != chip->id && (chipId >> 16) != chip->id) {
         setNum("MtkChipIdRaw", chipId);
         setNum("MtkAsicRevision", (chip->id << 16) | (hwRev & 0xff));
     }

@@ -52,10 +52,10 @@ IOReturn WTLWirelessUserClient::externalMethod(uint32_t selector, IOExternalMeth
     return IOUserClient::externalMethod(selector, args, dispatch, target, reference);
 }
 
-// Run one selector on the core's gate. Scan / join / disconnect change state and need an administrator.
+// Run one selector on the core's gate. Join / disconnect change state and need an administrator; scan is open.
 IOReturn WTLWirelessUserClient::call(uint32_t selector, const void *in, void *out, uint32_t *outSize) {
     if (!core || !core->userClientAllowed()) return kIOReturnNotReady;
-    if ((selector == kMtkUcScan || selector == kMtkUcJoin || selector == kMtkUcDisconnect || selector == kMtkUcTune) && !admin) return kIOReturnNotPrivileged;
+    if ((selector == kMtkUcJoin || selector == kMtkUcDisconnect || selector == kMtkUcTune) && !admin) return kIOReturnNotPrivileged;
     IOWorkLoop *wl = core->getWorkLoop();
     if (!wl) return kIOReturnNotReady;
     return wl->runAction(&WTLWireless::gatedUserCall, core, (void *)(uintptr_t)selector, const_cast<void *>(in), out, outSize);

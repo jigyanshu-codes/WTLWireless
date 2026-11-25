@@ -51,6 +51,14 @@ struct MtkChip {
     const uint16_t *chipIdAlt;          // other raw CHIPID low words the hardware is known to report (0 is one of them)
     uint8_t nChipIdAlt;
     const char *optInArg;               // boot-arg that must be 1 for the chip to run; nullptr = verified on our hardware
+    uint32_t directWindow;              // direct BAR0 window (< this returns addr directly)
+    uint32_t remapL1;                   // HIF remap L1 register
+    uint32_t remapL1Mask;               // HIF remap L1 mask
+    uint8_t  remapL1Shift;              // HIF remap L1 shift
+    uint32_t remapBaseL1;               // HIF remap L1 target base
+    uint32_t txdHdrFormat;              // TXD1 header format: (1u << 31) | (1u << 16) for MT7902, 1u << 14 for MT7925
+    uint8_t  mcuRxdSeq;                 // offset of seq in RXD: 29 for MT7902, 37 for MT7925
+    uint8_t  mcuRxdStatus;              // offset of status in RXD: 32 for MT7902, 40 for MT7925
 };
 
 // The row for a PCI device ID, or nullptr for a card this driver must not touch

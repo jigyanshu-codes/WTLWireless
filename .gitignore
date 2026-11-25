@@ -2,3 +2,4 @@ out/
 MacKernelSDK/
 .export-staging/
 .DS_Store
+__pycache__/

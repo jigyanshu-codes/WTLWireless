@@ -59,7 +59,7 @@ bool WTLWirelessNativeIf::init() {
     beaconMsg = (uint8_t *)IOMalloc(kBeaconHeader + MTK_BSS_IE_MAX);
     statusBuf = (struct mtk_status *)IOMalloc(sizeof(struct mtk_status));
     curBss = (struct mtk_bss_info *)IOMalloc(sizeof(struct mtk_bss_info));
-    lqmMsg = (uint8_t *)IOMalloc(0x1dc);
+    lqmMsg = (uint8_t *)IOMalloc(kLqmSize);
     return lock != nullptr && bssSnap != nullptr && beaconMsg != nullptr;
 }
 
@@ -235,7 +235,7 @@ void WTLWirelessNativeIf::free() {
     if (beaconMsg) { IOFree(beaconMsg, kBeaconHeader + MTK_BSS_IE_MAX); beaconMsg = nullptr; }
     if (statusBuf) { IOFree(statusBuf, sizeof(struct mtk_status)); statusBuf = nullptr; }
     if (curBss) { IOFree(curBss, sizeof(struct mtk_bss_info)); curBss = nullptr; }
-    if (lqmMsg) { IOFree(lqmMsg, 0x1dc); lqmMsg = nullptr; }
+    if (lqmMsg) { IOFree(lqmMsg, kLqmSize); lqmMsg = nullptr; }
     if (lock) { IOLockFree(lock); lock = nullptr; }
     super::free();
 }
@@ -600,7 +600,11 @@ void WTLWirelessNativeIf::pollControl() {
     IOLockUnlock(lock);
     if (dirty && ctl) {
         ctl->setLinkStatus(kIONetworkLinkValid | (up ? kIONetworkLinkActive : 0), up ? ctl->getSelectedMedium() : nullptr, up ? speed : 0);
+#if MTK_NATIVE_ABI_MAJOR < 25
+        bool ok = IO80211InfraInterface::setLinkState((IO80211LinkState)(up ? 2 : 1), 0, false, 0);
+#else
         bool ok = IO80211InfraInterface::setLinkState((IO80211LinkState)(up ? 2 : 1), 0, false, 0, 0);
+#endif
         nativeTrace(ctl, "dp:link=%u family=%u state=%u", up, ok, IO80211InfraInterface::linkState());
         setProperty("MtkNativeRadioLink", up);
     }

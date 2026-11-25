@@ -8,12 +8,8 @@
 #include "WTLWireless.hpp"
 
 namespace {
-// mt7925/regs.h
-constexpr uint32_t MT_HIF_REMAP_L1        = 0x155024;
-constexpr uint32_t MT_HIF_REMAP_L1_MASK   = 0xffff0000; // GENMASK(31, 16)
-constexpr uint32_t MT_HIF_REMAP_BASE_L1   = 0x130000;
 constexpr uint32_t MT_HIF_REMAP_L2        = 0x0120;
-constexpr uint32_t MT_HIF_REMAP_BASE_L2   = 0x18500000; // CONFIG_MT76_DEV is not a Kconfig symbol
+constexpr uint32_t MT_HIF_REMAP_BASE_L2   = 0x18500000;
 } // namespace
 
 uint32_t WTLWireless::rawRead(uint32_t off) {
@@ -33,30 +29,34 @@ uint32_t WTLWireless::rawRmw(uint32_t off, uint32_t mask, uint32_t val) {
 }
 
 void WTLWireless::remapRestore() {
-    if (backupL1) { rawWrite(MT_HIF_REMAP_L1, backupL1); backupL1 = 0; }
+    if (!chip) return;
+    if (backupL1) { rawWrite(chip->remapL1, backupL1); backupL1 = 0; }
     if (backupL2) { rawWrite(MT_HIF_REMAP_L2, backupL2); backupL2 = 0; }
 }
 
 uint32_t WTLWireless::mapL1(uint32_t addr) {
+    if (!chip) return addr;
     uint32_t offset = addr & 0xffff;
-    uint32_t base = addr >> 16;
-    backupL1 = rawRead(MT_HIF_REMAP_L1);
-    rawRmw(MT_HIF_REMAP_L1, MT_HIF_REMAP_L1_MASK, base << 16);
-    rawRead(MT_HIF_REMAP_L1); // read to push the write
-    return MT_HIF_REMAP_BASE_L1 + offset;
+    uint32_t base = (addr >> 16) & 0xffff;
+    backupL1 = rawRead(chip->remapL1);
+    rawRmw(chip->remapL1, chip->remapL1Mask, (base << chip->remapL1Shift) & chip->remapL1Mask);
+    rawRead(chip->remapL1); // read to push the write
+    return chip->remapBaseL1 + offset;
 }
 
 uint32_t WTLWireless::mapL2(uint32_t addr) {
-    uint32_t base = MT_HIF_REMAP_BASE_L2 >> 16;
-    backupL2 = rawRead(MT_HIF_REMAP_L1);
-    rawRmw(MT_HIF_REMAP_L1, MT_HIF_REMAP_L1_MASK, base << 16);
+    if (!chip) return addr;
+    uint32_t base = (MT_HIF_REMAP_BASE_L2 >> 16) & 0xffff;
+    backupL2 = rawRead(chip->remapL1);
+    rawRmw(chip->remapL1, chip->remapL1Mask, (base << chip->remapL1Shift) & chip->remapL1Mask);
     rawWrite(MT_HIF_REMAP_L2, addr);
-    rawRead(MT_HIF_REMAP_L1); // read to push the write
-    return MT_HIF_REMAP_BASE_L1;
+    rawRead(chip->remapL1); // read to push the write
+    return chip->remapBaseL1;
 }
 
 uint32_t WTLWireless::regAddr(uint32_t addr) {
-    if (addr < 0x200000)
+    uint32_t directWin = chip ? chip->directWindow : 0x100000;
+    if (addr < directWin)
         return addr;
 
     remapRestore();

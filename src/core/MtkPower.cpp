@@ -17,11 +17,12 @@
 
 namespace {
 constexpr uint8_t UNI_EFUSE_CTRL = 0x2d, UNI_SET_POWER_LIMIT = 0x2c;
-constexpr uint32_t MT_EE_HW_TYPE = 0xa71, EEPROM_BLOCK = 16;
+constexpr uint32_t MT_EE_HW_TYPE = 0xa71, MT7902_EE_HW_TYPE = 0x55b, EEPROM_BLOCK = 16;
 constexpr uint32_t SKU_LEN = 449;                 // MT_CONNAC3_SKU_POWER_LIMIT
 constexpr uint8_t ENVIRON_INDOOR = 1;
 constexpr uint8_t FW_FEATURE_NON_DL = 1u << 6, FW_TYPE_CLC = 2;
 
+inline uint16_t le16(const uint8_t *p) { return (uint16_t)((uint32_t)p[1] << 8 | p[0]); }
 inline uint32_t le32(const uint8_t *p) { return (uint32_t)p[3] << 24 | (uint32_t)p[2] << 16 | (uint32_t)p[1] << 8 | p[0]; }
 inline void put16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
 inline void put32(uint8_t *p, uint32_t v) { for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i)); }
@@ -29,6 +30,19 @@ inline void put32(uint8_t *p, uint32_t v) { for (int i = 0; i < 4; i++) p[i] = (
 
 // mt7925_mcu_read_eeprom: one byte of the efuse/EEPROM buffer through an EFUSE_CTRL query
 int WTLWireless::readEeprom(uint32_t offset, uint8_t *val) {
+    if (chip && chip->id == 0x7902) {
+        // ConNaC2: MCU_EXT_QUERY(EFUSE_ACCESS = 0x01), response: 36B rxd + addr(4) + valid(4) + data[16]
+        uint8_t req[24] = {};
+        put32(req, offset & ~(EEPROM_BLOCK - 1));
+        static uint8_t ev[128];
+        uint32_t evl = 0;
+        int rc = ceCmd(0xed, 0x01, req, sizeof(req), true, true, ev, sizeof(ev), &evl);
+        if (rc) return rc;
+        uint32_t at = 36 + 8 + (offset % EEPROM_BLOCK);
+        if (evl <= at) return -20;
+        *val = ev[at];
+        return 0;
+    }
     uint8_t req[4 + 4 + 4 + 4 + EEPROM_BLOCK] = {};
     put16(req + 4, 1);                            // tag
     put16(req + 6, sizeof(req) - 4);
@@ -37,20 +51,26 @@ int WTLWireless::readEeprom(uint32_t offset, uint8_t *val) {
     uint32_t evl = 0;
     int rc = uniCmd(UNI_EFUSE_CTRL, req, sizeof(req), true, ev, sizeof(ev), &evl);
     if (rc) return rc;
-    // event payload at 44: rsv[4] tag len ver addr valid size magic type rsv1[16] data[32]
     uint32_t at = 44 + 48 + (offset % EEPROM_BLOCK);
     if (evl <= at) return -20;
     *val = ev[at];
     return 0;
 }
 
+int WTLWireless::mcuRegRead(uint32_t addr) {
+    uint8_t req[8] = {};
+    put32(req, addr);
+    return ceCmd(0xc0 /* MCU_CE_CMD_REG_READ */, 0, req, sizeof(req), true /* MCU_Q_QUERY */, true /* wait */);
+}
+
 // The CLC tables (idx 0 power, 1 power ext) inside the RAM firmware's non-downloaded CLC region
 int WTLWireless::clcStage() {
     uint8_t hw = 0;
-    int rc = readEeprom(MT_EE_HW_TYPE, &hw);
+    bool is7902 = (chip && chip->id == 0x7902);
+    int rc = readEeprom(is7902 ? MT7902_EE_HW_TYPE : MT_EE_HW_TYPE, &hw);
     setNum("MtkW9EepromHwType", rc ? 0xffff0000u | (uint16_t)rc : hw);
     if (rc) return -1;
-    uint8_t encap = hw & 3;
+    uint8_t encap = is7902 ? (hw & 1) : (hw & 3);
 
     const uint32_t fwLen = *chip->ram.len;
     const uint8_t *fw = chip->ram.data, *trailer = fw + fwLen - 36;
@@ -72,43 +92,81 @@ int WTLWireless::clcStage() {
         uint8_t idx = c[4];
         if (!len || o + len > clcLen) break;
         if (idx >= 3) break;                         // ARRAY_SIZE(phy->clc)
-        if (idx < 2 && !tables[idx] && (c[7] & 3) == encap) tables[idx] = c;   // t0.type encap matches
+        uint8_t cEncap = is7902 ? (c[7] & 1) : (c[7] & 3);
+        if (idx < 2 && !tables[idx] && (!is7902 || idx != 0 || cEncap == encap) && (is7902 || cEncap == encap))
+            tables[idx] = c;                         // t0.type encap matches
         o += len;
     }
 
     int sent = 0, failed = 0;
-    for (int idx = 0; idx < 2; idx++) {
-        const uint8_t *c = tables[idx];
-        if (!c) continue;
-        const uint8_t *data = c + 16;
-        uint8_t nSeg = c[8];
-        const uint8_t *pos = data + 16 * nSeg, *last = data + le32(data + 4);
-        const char *const countries[2] = {country, "00"};
-        for (const char *cc : countries) {
-            int matched = 0;
-            for (const uint8_t *r = pos; r + 8 <= last; r += 8) {
-                if (r[0] != (uint8_t)cc[0] || r[1] != (uint8_t)cc[1]) continue;
-                uint8_t segIdx = r[4];
-                if (!segIdx || segIdx > nSeg) continue;
-                const uint8_t *seg = data + 16 * (segIdx - 1);
-                uint32_t sOff = le32(seg + 4), sLen = le32(seg + 8);
-                static uint8_t msg[84 + 1400];
-                if (sLen > sizeof(msg) - 84 || 16 + sOff + sLen > le32(c)) { failed++; continue; }
-                bzero(msg, 84);
-                put16(msg + 4, 3);                    // tag
-                put16(msg + 6, (uint16_t)(80 + sLen));   // sizeof(req) + seg len - 4 (upstream after v6.18)
-                msg[8] = c[5];                        // ver
-                put16(msg + 10, (uint16_t)sLen);      // size
-                msg[12] = (uint8_t)idx;
-                msg[13] = ENVIRON_INDOOR;
-                msg[16] = r[0]; msg[17] = r[1];       // alpha2
-                msg[18] = r[2]; msg[19] = r[3];       // type
-                memcpy(msg + 84, data + sOff, sLen);
-                if (uniCmd(UNI_SET_POWER_LIMIT, msg, 84 + sLen, false, nullptr, 0, nullptr)) failed++;
-                else sent++;
-                matched++;
+    const char *const countries[2] = {country, "00"};
+    if (is7902) {
+        // mt7921_load_clc / __mt7921_mcu_set_clc: sequential mt7921_clc_rule records + MCU_CE_CMD_SET_CLC (0x5c)
+        for (int idx = 0; idx < 2; idx++) {
+            const uint8_t *c = tables[idx];
+            if (!c) continue;
+            uint32_t tblLen = le32(c);
+            const uint8_t *data = c + 16, *end = c + tblLen;
+            for (const char *cc : countries) {
+                int matched = 0;
+                for (const uint8_t *r = data; r + 6 <= end;) {
+                    uint16_t sLen = le16(r + 4);
+                    const uint8_t *payload = r + 6;
+                    r += 6 + sLen;
+                    if (r > end) break;
+                    if (payload[-6] != (uint8_t)cc[0] || payload[-5] != (uint8_t)cc[1]) continue;
+                    static uint8_t msg[76 + 1400];
+                    if (sLen > sizeof(msg) - 76) { failed++; continue; }
+                    bzero(msg, 76);
+                    msg[0] = 1;                       // ver = 1
+                    put16(msg + 2, (uint16_t)(76 + sLen));
+                    msg[4] = (uint8_t)idx;
+                    msg[5] = ENVIRON_INDOOR;
+                    bool clcEvt = (nicChipCap & 1u) != 0; // MT792x_CHIP_CAP_CLC_EVT_EN
+                    if (clcEvt) msg[7] |= 1u;             // CLC_CAP_EVT_EN
+                    msg[8] = payload[-6]; msg[9] = payload[-5];   // alpha2
+                    msg[10] = payload[-4]; msg[11] = payload[-3]; // type
+                    memcpy(msg + 76, payload, sLen);
+                    if (ceCmd(0x5c /* MCU_CE_CMD_SET_CLC */, 0, msg, 76 + sLen, false, clcEvt)) failed++;
+                    else sent++;
+                    matched++;
+                }
+                if (matched) break;                   // "00" only when the country has no rule
             }
-            if (matched) break;                       // "00" only when the country has no rule
+        }
+    } else {
+        for (int idx = 0; idx < 2; idx++) {
+            const uint8_t *c = tables[idx];
+            if (!c) continue;
+            const uint8_t *data = c + 16;
+            uint8_t nSeg = c[8];
+            const uint8_t *pos = data + 16 * nSeg, *last = data + le32(data + 4);
+            for (const char *cc : countries) {
+                int matched = 0;
+                for (const uint8_t *r = pos; r + 8 <= last; r += 8) {
+                    if (r[0] != (uint8_t)cc[0] || r[1] != (uint8_t)cc[1]) continue;
+                    uint8_t segIdx = r[4];
+                    if (!segIdx || segIdx > nSeg) continue;
+                    const uint8_t *seg = data + 16 * (segIdx - 1);
+                    uint32_t sOff = le32(seg + 4), sLen = le32(seg + 8);
+                    static uint8_t msg[84 + 1400];
+                    if (sLen > sizeof(msg) - 84 || 16 + sOff + sLen > le32(c)) { failed++; continue; }
+                    bzero(msg, 84);
+                    put16(msg + 4, 3);                // tag
+                    put16(msg + 6, (uint16_t)(80 + sLen)); // sizeof(req) + seg len - 4 (upstream after v6.18)
+                    msg[8] = c[5];                    // ver
+                    put16(msg + 10, (uint16_t)sLen);  // size
+                    msg[12] = (uint8_t)idx;
+                    msg[13] = ENVIRON_INDOOR;
+                    msg[16] = r[0]; msg[17] = r[1];   // alpha2
+                    msg[18] = r[2]; msg[19] = r[3];   // type
+                    memcpy(msg + 84, data + sOff, sLen);
+                    if (uniCmd(UNI_SET_POWER_LIMIT, msg, 84 + sLen, false, nullptr, 0, nullptr)) failed++;
+                    else sent++;
+                    matched++;
+                }
+                if (matched) break;                   // "00" only when the country has no rule
+            }
         }
     }
     setNum("MtkW9ClcSent", (uint32_t)sent);
@@ -116,14 +174,50 @@ int WTLWireless::clcStage() {
     return failed ? -4 : (sent ? 0 : -5);
 }
 
-// mt7925_mcu_rate_txpower_band: per-channel SKU limits, 3 channels per message
+// Per-channel SKU limits: ConNaC2 MCU_CE_CMD_SET_RATE_TX_POWER (0x5d, 8/msg) vs ConNaC3 UNI_SET_POWER_LIMIT (3/msg)
 int WTLWireless::ratePowerBand(bool is5g, int8_t halfDbm) {
     static const uint8_t ch2[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14};
+    static const uint8_t ch5_7902[] = {
+        36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 62, 64, 100, 102, 104, 106, 108, 110,
+        112, 114, 116, 118, 120, 122, 124, 126, 128, 132, 134, 136, 138, 140, 142, 144, 149, 151,
+        153, 155, 157, 159, 161, 165, 169, 173, 177
+    };
     static const uint8_t ch5[] = {36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 62, 64, 100, 102, 104, 106, 108, 110,
                                   112, 114, 116, 118, 120, 122, 124, 126, 128, 132, 134, 136, 138, 140, 142, 144, 149, 151,
                                   153, 155, 157, 159, 161, 165, 167};
-    const uint8_t *list = is5g ? ch5 : ch2;
-    int n = is5g ? (int)sizeof(ch5) : (int)sizeof(ch2);
+    bool is7902 = (chip && chip->id == 0x7902);
+    const uint8_t *list = is5g ? (is7902 ? ch5_7902 : ch5) : ch2;
+    int n = is5g ? (is7902 ? (int)sizeof(ch5_7902) : (int)sizeof(ch5)) : (int)sizeof(ch2);
+    if (is7902) {
+        // mt76_connac_mcu_rate_txpower_band: batch 8, struct mt76_connac_tx_power_limit_tlv (44B) + n * 162B
+        constexpr uint32_t CONNAC2_SKU_LEN = 161;
+        static uint8_t msg[44 + 8 * (1 + CONNAC2_SKU_LEN)];
+        int failed = 0;
+        for (int i = 0; i < n; i += 8) {
+            int num = n - i < 8 ? n - i : 8;
+            bzero(msg, 44);
+            msg[4] = (uint8_t)num;                    // n_chan
+            msg[5] = is5g ? 2 : 1;                    // band
+            msg[6] = (is5g && i + num >= n) ? 1 : 0;  // last_msg
+            msg[8] = (uint8_t)country[0]; msg[9] = (uint8_t)country[1]; // alpha2
+            uint8_t *p = msg + 44;
+            for (int j = 0; j < num; j++, p += 1 + CONNAC2_SKU_LEN) {
+                p[0] = list[i + j];
+                uint8_t *sku = p + 1;
+                memset(sku, 127, CONNAC2_SKU_LEN);
+                if (!is5g) memset(sku, (uint8_t)halfDbm, 4);                // cck
+                memset(sku + 4, (uint8_t)halfDbm, 8);                       // ofdm
+                memset(sku + 12, (uint8_t)halfDbm, 17);                     // ht (2x8 + mcs32)
+                for (int k = 0; k < 4; k++) memset(sku + 29 + 12 * k, (uint8_t)halfDbm, 10); // vht
+                memset(sku + 77, (uint8_t)halfDbm, 84);                     // he (7x12)
+            }
+            if (ceCmd(0x5d /* MCU_CE_CMD_SET_RATE_TX_POWER */, 0, msg, (uint32_t)(p - msg), false, false))
+                failed++;
+            else if (mcuRegRead(0x820c8000u))         // mt76_connac_mcu_reg_rr(MT_PSE_BASE) to avoid PSE buffer underflow
+                failed++;
+        }
+        return failed;
+    }
     static uint8_t msg[52 + 3 * (1 + SKU_LEN)];
     int failed = 0;
     for (int i = 0; i < n; i += 3) {

@@ -40,6 +40,45 @@
 				<array>
 					<dict>
 						<key>Build</key>
+						<string>24H241</string>
+						<key>Sizes</key>
+						<dict>
+							<key>IO80211CommandGate</key>
+							<integer>24</integer>
+							<key>IO80211Controller</key>
+							<integer>296</integer>
+							<key>IO80211InfraInterface</key>
+							<integer>288</integer>
+							<key>IO80211InfraProtocol</key>
+							<integer>288</integer>
+							<key>IO80211SkywalkInterface</key>
+							<integer>280</integer>
+							<key>IO80211WorkQueue</key>
+							<integer>80</integer>
+							<key>IOSkywalkEthernetInterface</key>
+							<integer>272</integer>
+							<key>IOSkywalkInterface</key>
+							<integer>176</integer>
+							<key>IOSkywalkNetworkInterface</key>
+							<integer>208</integer>
+							<key>IOSkywalkPacketBufferPool</key>
+							<integer>184</integer>
+							<key>IOSkywalkPacketQueue</key>
+							<integer>216</integer>
+							<key>IOSkywalkRxCompletionQueue</key>
+							<integer>312</integer>
+							<key>IOSkywalkRxSubmissionQueue</key>
+							<integer>320</integer>
+							<key>IOSkywalkTxCompletionQueue</key>
+							<integer>296</integer>
+							<key>IOSkywalkTxSubmissionQueue</key>
+							<integer>360</integer>
+						</dict>
+						<key>Xnu</key>
+						<string>xnu-11417.140.69.713.47~2</string>
+					</dict>
+					<dict>
+						<key>Build</key>
 						<string>25G241</string>
 						<key>Sizes</key>
 						<dict>

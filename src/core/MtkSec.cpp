@@ -21,6 +21,10 @@ const uint8_t kSnap[6] = {0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00};
 } // namespace
 
 void WTLWireless::secReset() {
+    secM1Total += supp.m1;
+    secM2Total += supp.m2;
+    secM3Total += supp.m3;
+    secM4Total += supp.m4;
     mtk_supp_clear(&supp);
     suppActive = false;
     ptkInstalled = false;

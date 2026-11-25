@@ -227,8 +227,13 @@ IOReturn WTLWirelessNativeIf::getHW_SUPPORTED_CHANNELS(apple80211_sup_channel_da
 // the IOMACAddress property). The core re-registers its firmware station interface with the address, synchronously on
 // its gate, so the private address macOS picks per network is the one the hardware accepts unicast for (I-058: it
 // associated and DHCP never saw a reply while this refused and the firmware kept the factory address).
+#if MTK_NATIVE_ABI_MAJOR < 25
+IOReturn WTLWirelessNativeIf::setMacAddress(ether_addr &addresses) {
+    nativeCall(ctl, 'S', 417);
+#else
 IOReturn WTLWirelessNativeIf::setMacAddress(mloAddrArray &addresses) {
     nativeCall(ctl, 'S', 470);
+#endif
     uint8_t m[6];
     memcpy(m, &addresses, 6);
     if ((m[0] & 1) || !(m[0] | m[1] | m[2] | m[3] | m[4] | m[5])) {
@@ -262,7 +267,9 @@ IOReturn WTLWirelessNativeIf::gatedSetMac(OSObject *owner, void *mac, void *rc, 
 // beacon rather than a probe response, 0x4000 rssi valid). 24H32 had the flags at +0x3c and the IEs at +0x40 (itlmt7925Native).
 // Then 0xed, scan done, a 4-byte status (0 = ok), which WCLScanManager::scanDoneEventHandler ends the request with.
 namespace {
-const uint32_t kEventScanResult = 0xc9, kEventScanDone = 0xed, kBeaconHeader = 0x44;   // == WTLWirelessNativeIf::kBeaconHeader
+const uint32_t kEventScanResult = 0xc9, kEventScanDone = 0xed;
+const uint32_t kBeaconHeader = WTLWirelessNativeIf::kBeaconHeader;
+const size_t kBeaconFlagsOff = MTK_NATIVE_ABI_MAJOR < 25 ? 0x3cu : 0x40u;
 void buildBeacon(uint8_t *m, const mtk_bss_info &b) {
     const uint32_t ieLen = b.ie_len > MTK_BSS_IE_MAX ? MTK_BSS_IE_MAX : b.ie_len;
     const uint8_t ssidLen = b.ssid_len > 32 ? 32 : b.ssid_len;
@@ -276,7 +283,7 @@ void buildBeacon(uint8_t *m, const mtk_bss_info &b) {
     store<int32_t>(m, 0x30, b.rssi);
     store<uint16_t>(m, 0x38, b.beacon_interval);
     store<uint16_t>(m, 0x3a, b.capability);
-    store<uint32_t>(m, 0x40, 2u | (b.probe_resp ? 0u : 0x80u) | (b.rssi ? 0x4000u : 0u));
+    store<uint32_t>(m, kBeaconFlagsOff, 2u | (b.probe_resp ? 0u : 0x80u) | (b.rssi ? 0x4000u : 0u));
     memcpy(m + kBeaconHeader, b.ie, ieLen);
 }
 } // namespace
@@ -396,12 +403,9 @@ void WTLWirelessNativeIf::deliverScanResults() {
 namespace {
 const uint32_t kEventAssoc = 0x4e, kEventJoin = 0xd3, kEventFirstBeacon = 0xd4, kEventConnect = 0xd5, kEventLinkStatus = 0xd8;
 const uint32_t kEventBeaconCounter = 0xaf;   // WCLNetManager::updateBeaconCounter: u32 beacons since the last report at +0x54
-// WCLNetManager::handleLqmUpdate (event 0x27, exactly 0x1dc bytes): the Family's assoc timer declares "missed beacons" when
-// neither of two timestamps moved for 60 s. This message refreshes both: the beacon one when +0x1d8, +0x1d9 and +0x30 are
-// nonzero and the u32 beacon count at +0x28 is nonzero; the traffic one when +0x1d8, +0x1d9 are nonzero and the u32 at
-// +0x1c exceeds the one at +0x14 or the u32 at +0x24 is nonzero. +0 nonzero makes the s32 at +4 the RSSI; +0x54 nonzero
-// skips a callback whose contract is not read. Everything else is left zero (optional sections, each with its own flag).
-const uint32_t kEventLqmUpdate = 0x27, kLqmSize = 0x1dc;
+// WCLConfigManager / WCLNetManager::handleLqmUpdate (event 0x27: 0x150 bytes on 24H, 0x1dc bytes on 25G): +0/+4 update RSSI
+// and +0x54 nonzero skips the callback; 25G also checks timestamps at +0x14/+0x1c/+0x24/+0x28/+0x30/+0x1d8/+0x1d9.
+const uint32_t kEventLqmUpdate = 0x27;
 }
 
 IOReturn WTLWirelessNativeIf::gatedJoin(OSObject *owner, void *params, void *rc, void *, void *) {
@@ -502,7 +506,11 @@ IOReturn WTLWirelessNativeIf::setWCL_LEAVE_NETWORK(apple80211_leave_network *) {
     return kIOReturnSuccess;
 }
 
+#if MTK_NATIVE_ABI_MAJOR < 25
+IOReturn WTLWirelessNativeIf::setWCL_JOIN_ABORT(void *) {
+#else
 IOReturn WTLWirelessNativeIf::setWCL_JOIN_ABORT(apple80211_wcl_abort_join *) {
+#endif
     nativeCall(ctl, 'S', 601);
     IOLockLock(lock);
     bool was = joinActive;
@@ -573,10 +581,12 @@ IOReturn WTLWirelessNativeIf::getWCL_EXTENDED_BSS_INFO(apple80211_extended_bss_i
     nativeCall(ctl, 'S', 533);
     if (!d) return kIOReturnError;
     uint8_t *b = (uint8_t *)d;
+    static const size_t kExtBssClearSize = MTK_NATIVE_ABI_MAJOR < 25 ? 0x1de : 0x214;
+    static const size_t kExtBssIeOff = MTK_NATIVE_ABI_MAJOR < 25 ? 0xdd : 0x113;
     static const uint32_t verOff[4] = {0, 0xbc, 0xcc, 0xd4};
     uint32_t ver[4];
     for (int i = 0; i < 4; i++) ver[i] = load<uint32_t>(b, verOff[i]);
-    bzero(b, 0x214);
+    bzero(b, kExtBssClearSize);
     for (int i = 0; i < 4; i++) store<uint32_t>(b, verOff[i], ver[i]);
     store<uint16_t>(b, 0xcc + 4, 0xffff);
     store<uint16_t>(b, 0xd4 + 4, 0xffff);
@@ -601,14 +611,14 @@ IOReturn WTLWirelessNativeIf::getWCL_EXTENDED_BSS_INFO(apple80211_extended_bss_i
             } else if (id == 191 && l >= 12 && curBss->channel > 14) {               // VHT Capabilities: RX MCS map
                 store<uint16_t>(b, 0xcc + 4, vhtMapAnd(load<uint16_t>(v, 4), vhtOurMap(ctl->chip().nss)));
             } else if (id == 0x30 && !rsnLen && l + 2u <= 0x101) {                   // RSN
-                memcpy(b + 0x113, ie + p, l + 2u);
+                memcpy(b + kExtBssIeOff, ie + p, l + 2u);
                 rsnLen = l + 2u;
             } else if (id == 0xdd && !wpa && l >= 4 && v[0] == 0x00 && v[1] == 0x50 && v[2] == 0xf2 && v[3] == 0x01 && l + 2u <= 0x101) {
                 wpa = ie + p;                                                        // WPA vendor element
                 wpaLen = l + 2u;
             }
         }
-        if (!rsnLen && wpa) { memcpy(b + 0x113, wpa, wpaLen); rsnLen = wpaLen; }
+        if (!rsnLen && wpa) { memcpy(b + kExtBssIeOff, wpa, wpaLen); rsnLen = wpaLen; }
         store<uint16_t>(b, 4, (uint16_t)nrates);
     }
     if (extBssTraced++ < 4) nativeTrace(ctl, "wcl:extended bss info rates=%u rsn=%u", nrates, rsnLen);
@@ -713,6 +723,9 @@ void WTLWirelessNativeIf::serviceJoin() {
                 bzero(lqmMsg, kLqmSize);
                 lqmMsg[0] = 1;
                 store<int32_t>(lqmMsg, 4, found ? curBss->rssi : -60);
+#if MTK_NATIVE_ABI_MAJOR < 25
+                lqmMsg[0x54] = 1;
+#else
                 store<uint32_t>(lqmMsg, 0x14, lqmTick);                                // a counter that grows: +0x1c > +0x14
                 store<uint32_t>(lqmMsg, 0x1c, lqmTick + 1);
                 store<uint32_t>(lqmMsg, 0x24, rxDelivered ? rxDelivered : 1);           // frames received
@@ -722,6 +735,7 @@ void WTLWirelessNativeIf::serviceJoin() {
                 lqmMsg[0x1d8] = 1;
                 lqmMsg[0x1d9] = 1;
                 lqmTick++;
+#endif
                 postEvent(kEventLqmUpdate, lqmMsg, kLqmSize);
             }
             int32_t rssi = found ? curBss->rssi : -60;

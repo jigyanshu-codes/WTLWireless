@@ -92,13 +92,59 @@ void WTLWireless::txQueue(uint32_t flen, uint8_t qIdx, uint8_t ftype, uint8_t st
     uint32_t pa = txData.bufs.iova + slot * txData.bufSize;
     bzero(w, 128);
     put32(w + 0, (flen + 32) | (0u << 23) | ((uint32_t)qIdx << 25));            // TX_BYTES, PKT_FMT CT, Q_IDX
-    put32(w + 4, AP_WCID | (2u << 14) | ((hdrLen / 2) << 16) | ((uint32_t)(tid & 0xf) << 21) |
-                 (rate ? 1u << 31 : 0));                                       // WLAN_IDX, HDR 802.11, HDR_INFO, TID, FIXED_RATE
-    put32(w + 8, ((uint32_t)ftype << 4) | stype);                                 // FRAME_TYPE, SUB_TYPE
+    bool is7902 = (chip && chip->id == 0x7902);
+    if (is7902) {
+        // connac2 (MT7902 / MT7921):
+        // MT_TXD1_LONG_FORMAT: BIT(31) (must be set when DW4-DW7 are present)
+        // MT_TXD1_HDR_FORMAT: bits 17:16 (2 = 802.11)
+        // MT_TXD1_HDR_INFO: bits 15:11 (hdrLen / 2)
+        // MT_TXD1_TID: bits 22:20
+        put32(w + 4, (1u << 31) | AP_WCID | (2u << 16) | (((hdrLen / 2) & 0x1f) << 11) | ((uint32_t)(tid & 0x7) << 20));
+        // In Linux mt76_connac2_mac_write_txwi_80211:
+        // MT_TXD2_FIX_RATE: BIT(31) for 802.11 fixed rate
+        // MT_TXD2_HTC_VLD: BIT(13) for mgmt/ctrl frames (hardware won't add HTC)
+        // MT_TXD2_MULTICAST: BIT(10)
+        uint32_t d2 = ((uint32_t)ftype << 4) | stype | (mcast ? (1u << 10) : 0) | (rate ? (1u << 31) : 0);
+        if (ftype == 0) d2 |= (1u << 13);                                      // MT_TXD2_HTC_VLD: hardware won't add HTC for mgmt/ctrl frame
+        put32(w + 8, d2);
+    } else {
+        // connac3 (MT7925 / MT7927):
+        put32(w + 4, AP_WCID | (2u << 14) | ((hdrLen / 2) << 16) | ((uint32_t)(tid & 0xf) << 21) |
+                     (rate ? 1u << 31 : 0));                                       // WLAN_IDX, HDR 802.11, HDR_INFO, TID, FIXED_RATE
+        put32(w + 8, ((uint32_t)ftype << 4) | stype);                                 // FRAME_TYPE, SUB_TYPE
+    }
     // BA_DISABLE with TX status or a fixed rate, as at the end of mt7925_mac_write_txwi; PROTECT_FRAME with a key
-    put32(w + 12, (15u << 11) | (mcast ? 1u << 4 : 0) | ((status || rate) ? 1u << 28 : 0) | (protect ? 1u << 1 : 0));
+    uint32_t d3 = (15u << 11) | (mcast ? 1u << 4 : 0) | ((status || rate) ? 1u << 28 : 0) | (protect ? 1u << 1 : 0);
+    if (is7902 && ftype == 0) {
+        uint16_t sn = (le16(w + 128 + 22) >> 4) & 0xfff;
+        d3 |= (1u << 31) | ((uint32_t)sn << 16);                          // MT_TXD3_SN_VALID | MT_TXD3_SEQ
+    }
+    put32(w + 12, d3);
     put32(w + 20, status ? (3 | (1u << 10)) : 0);                                 // PID, TX_STATUS_HOST
-    put32(w + 24, (1u << 2) | (1u << 4) | (1u << 3) | ((uint32_t)rate << 16));    // DAS, MSDU_CNT 1, DIS_MAT, TX_RATE
+    if (is7902) {
+        // In Connac2 (mt76_connac2_mac.h / mt76_rates in mac80211.c):
+        // MT_TX_RATE_MODE: bits 9:6 (0: CCK, 1: OFDM)
+        // MT_TX_RATE_IDX: bits 5:0 (OFDM: 6M=11, 9M=15, 12M=10, 18M=14, 24M=9; CCK: 1M=0, 2M=1)
+        uint32_t txRate = 0;
+        if (rate) {
+            if (tgtCh > 14) {
+                // 5 GHz: OFDM 6 Mbps = Mode 1, Index 11 (0x4b)
+                if (rate == RATE_IDX_OFDM12) txRate = (1u << 6) | 10;
+                else if (rate == RATE_IDX_OFDM24) txRate = (1u << 6) | 9;
+                else txRate = (1u << 6) | 11;
+            } else {
+                // 2.4 GHz: CCK 1 Mbps = Mode 0, Index 0 (0x00)
+                if (rate == RATE_IDX_OFDM12) txRate = 1; // CCK 2M
+                else txRate = 0; // CCK 1M
+            }
+            put32(w + 24, (1u << 2) | (txRate << 16));               // MT_TXD6_FIXED_BW | TX_RATE
+            put32(w + 28, (24u << 11) | ((uint32_t)ftype << 20) | ((uint32_t)stype << 16)); // MT_TXD7_SPE_IDX = 24 | TYPE | SUB_TYPE
+        } else {
+            put32(w + 28, ((uint32_t)ftype << 20) | ((uint32_t)stype << 16));
+        }
+    } else {
+        put32(w + 24, (1u << 2) | (1u << 4) | (1u << 3) | ((uint32_t)rate << 16));    // DAS, MSDU_CNT 1, DIS_MAT, TX_RATE
+    }
     put16(w + 32, (uint16_t)(slot | 0x8000));                                     // txp.msdu_id[0] = token | VALID
     put32(w + 40, pa + 128);                                                      // txp.ptr[0].buf0
     put16(w + 44, (uint16_t)(flen | 0x8000));                                     // len0 | LAST
@@ -123,6 +169,7 @@ bool WTLWireless::txMgmt(const uint8_t *frame, uint32_t len, uint8_t subtype, ui
     if (len > 1900 || len < 24) return false;
     if (!txSlotReady(true)) return false;                              // ring full: do not overwrite the head slot
     memcpy(txData.bufs.va + txData.head * txData.bufSize + 128, frame, len);
+    if (chip && chip->id == 0x7902 && qIdx == 0) qIdx = 0x10;
     txQueue(len, qIdx, 0, subtype, RATE_IDX_OFDM6, false, true, 24, tid);
     for (int t = 0; t < 2000; t++) {
         if ((rawRead(txData.regs + 12) & 0xffff) == txData.head) return true;
@@ -134,7 +181,35 @@ bool WTLWireless::txMgmt(const uint8_t *frame, uint32_t len, uint8_t subtype, ui
 // mt7925_mac_tx_free: release the tokens (slot indexes) listed in a TXRX_NOTIFY packet
 void WTLWireless::txFree(const uint8_t *p, uint32_t len) {
     txFreeEvents++;
-    if (len < 8 || ((le32(p + 4) >> 16) & 0xf) < 4) { txFreeBadVer++; return; }
+    if (len < 8) return;
+    char hex[65] = {};
+    uint32_t dumpLen = len < 32 ? len : 32;
+    for (uint32_t i = 0; i < dumpLen; i++) snprintf(hex + i * 2, 3, "%02x", p[i]);
+    setProperty("MtkLastTxFreeHex", hex);
+
+    if (chip && chip->id == 0x7902) {
+        // ConNaC2 tx free event (mt76_connac2_mac.h / mt7921_mac_tx_free)
+        uint32_t count = le16(p + 2) & 0x3ff;  // MT_TX_FREE_MSDU_CNT from free->ctrl
+        setNum("MtkTxFreeMsduCount", count);
+        for (uint32_t o = 8; o + 4 <= len && count > 0; o += 4) {
+            uint32_t info = le32(p + o);
+            if (info & (1u << 31)) { // MT_TX_FREE_PAIR
+                count++;
+                continue;
+            }
+            uint32_t msdu = (info >> 16) & 0x7fff; // MT_TX_FREE_MSDU_ID
+            uint8_t stat = (info >> 13) & 3;        // MT_TX_FREE_STATUS (0 = success, others = drop)
+            setNum("MtkLastTxFreeStatus", stat);
+            setNum("MtkLastTxFreeMsdu", msdu);
+            if (msdu < txData.n && txBusy[msdu]) {
+                txRelease((uint16_t)msdu);
+                txFreed++;
+            }
+            count--;
+        }
+        return;
+    }
+    if (((le32(p + 4) >> 16) & 0xf) < 4) { txFreeBadVer++; return; }
     uint32_t total = (le32(p) >> 16) & 0x3ff, count = 0;
     for (uint32_t o = 8; o + 4 <= len && count < total; o += 4) {
         uint32_t info = le32(p + o);
@@ -165,18 +240,28 @@ void WTLWireless::txFree(const uint8_t *p, uint32_t len) {
 void WTLWireless::rxFrame(const uint8_t *p, uint32_t len) {
     if (!(rxCtrl & DMA_CTL_LAST_SEC0)) { rxPartial++; return; }
     if (len < 32) { rxBad++; return; }
+    bool is7902 = (chip && chip->id == 0x7902);
     uint32_t rxd0 = le32(p), rxd1 = le32(p + 4), rxd2 = le32(p + 8), rxd3 = le32(p + 12);
+    uint32_t rxd4 = is7902 ? le32(p + 16) : 0;
     uint32_t total = rxd0 & 0xffff;
     if (total && total < len) len = total;
     if (rxd2 & ((1u << 23) | (1u << 24))) { rxBad++; return; }        // AMSDU_ERR, MAX_LEN_ERROR
-    if (rxd3 & (1u << 24)) { rxBad++; return; }                       // FCS_ERR
-    if (rxd1 & ((1u << 25) | (1u << 26))) { rxIcvErr++; return; }     // ICV / CCMP MIC / TKIP MIC error
-    uint32_t secMode = (rxd2 >> 16) & 0x1f;                           // RXD2 SEC_MODE: 0 none, 2 TKIP, 4 CCMP
+    if (is7902) {
+        if (rxd1 & (1u << 27)) { rxBad++; return; }                    // MT_RXD1_NORMAL_FCS_ERR (bit 27 in connac2)
+        if (rxd1 & ((1u << 25) | (1u << 26))) { rxIcvErr++; return; }  // ICV / TKIP MIC error
+    } else {
+        if (rxd3 & (1u << 24)) { rxBad++; return; }                    // FCS_ERR (connac3)
+        if (rxd1 & ((1u << 25) | (1u << 26))) { rxIcvErr++; return; }  // ICV / CCMP MIC / TKIP MIC error
+    }
+    uint32_t secMode = is7902 ? ((rxd1 >> 16) & 0x1f) : ((rxd2 >> 16) & 0x1f); // MT_RXD1_NORMAL_SEC_MODE (connac2 DW1 bits 20:16)
     bool decrypted = secMode != 0 && !(rxd1 & ((1u << 23) | (1u << 24)));   // and no CM / CLM error
     bool hasPn = false;
     uint64_t pn = 0;
-    if (rxd1 & (1u << 16)) {                                          // group 1: the PN, little-endian in bytes 0..5
-        uint32_t g1 = 32 + ((rxd1 & (1u << 19)) ? 16 : 0);            // after group 4 when present
+    uint32_t grp1Bit = is7902 ? (1u << 11) : (1u << 16);
+    uint32_t grp4Bit = is7902 ? (1u << 14) : (1u << 19);
+    uint32_t baseRxd = is7902 ? 24 : 32;
+    if (rxd1 & grp1Bit) {                                              // group 1: the PN, little-endian in bytes 0..5
+        uint32_t g1 = baseRxd + ((rxd1 & grp4Bit) ? 16 : 0);          // after group 4 when present
         if (g1 + 16 <= len) {
             for (int i = 5; i >= 0; i--) pn = pn << 8 | p[g1 + i];
             hasPn = true;
@@ -187,7 +272,8 @@ void WTLWireless::rxFrame(const uint8_t *p, uint32_t len) {
     const uint8_t *f = p + off;
     uint32_t flen = len - off;
 
-    if (rxd2 & (1u << 7)) {                                           // HDR_TRANS: already 802.3 (translation is off)
+    uint32_t hdrTransBit = is7902 ? (1u << 13) : (1u << 7);
+    if (rxd2 & hdrTransBit) {                                           // HDR_TRANS: already 802.3 (translation is off)
         if (rxd2 & (1u << 25)) { rxBad++; return; }
         rxTrans++;
         if (tgtRsn || !portOpen) { rxTransDrop++; return; }
@@ -227,22 +313,45 @@ void WTLWireless::rxFrame(const uint8_t *p, uint32_t len) {
         h += 2;                                                       // QoS control
         if (f[24] & 0x80) { rxAmsdu++; return; }                      // A-MSDU (not advertised beyond 3839, dropped)
         if (f[1] & 0x80) h += 4;                                      // HT control (Order)
+        if (is7902 && (rxd4 & 3) != 0) h += 2;                        // mt7921_mac_fill_rx: HW de-agg A-MSDU 2B pad
     }
     if (flen < h + 8) { rxBad++; return; }
-    const uint8_t *l = f + h;
-    if (memcmp(l, kSnap, 6) && memcmp(l, kBridgeTunnel, 6)) { rxNonSnap++; return; }
-    bool eapol = l[6] == 0x88 && l[7] == 0x8e;
     bool group = (f[4] & 1) != 0;
     int pnSlot = -1;
     if (protFrame) {
         // decrypted by the hardware (CCMP header and MIC already stripped); the cipher must be the expected one
         uint32_t want = (group && tgtGroup == 2) ? 2u : 4u;
-        if (!decrypted || secMode != want) { rxCipherMismatch++; return; }
+        if (!decrypted || secMode != want) {
+            if (rxCipherMismatch == 0 || (rxCipherMismatch & 31) == 0) {
+                char cdiag[160];
+                snprintf(cdiag, sizeof(cdiag), "sec %u want %u dec %d grp %d off %u h %u rxd1 %08x rxd4 %08x",
+                         secMode, want, decrypted ? 1 : 0, group ? 1 : 0, off, h, rxd1, rxd4);
+                setProperty("MtkRxCipherHex", cdiag);
+            }
+            rxCipherMismatch++;
+            return;
+        }
         if (secMode == 4) {
             if (hasPn) pnSlot = (group ? 8 : 0) + ((sub & 8) ? (f[24] & 0x7) : 0);   // replay counter: key, TID
             else rxNoPn++;                                            // no group 1: the PN is not reported
         }
-    } else if (tgtRsn && !eapol) {
+    }
+    const uint8_t *l = f + h;
+    if (memcmp(l, kSnap, 6) && memcmp(l, kBridgeTunnel, 6)) {
+        if (rxNonSnap == 0 || (rxNonSnap & 31) == 0) {
+            char snapDiag[192];
+            int pos = snprintf(snapDiag, sizeof(snapDiag), "len %u off %u h %u flen %u sec %u dec %d ams %u rxd1 %08x hdr:",
+                               len, off, h, flen, secMode, decrypted ? 1 : 0, rxd4 & 3, rxd1);
+            uint32_t dumpN = flen < 40 ? flen : 40;
+            for (uint32_t i = 0; i < dumpN && pos + 3 < (int)sizeof(snapDiag); i++)
+                pos += snprintf(snapDiag + pos, sizeof(snapDiag) - (size_t)pos, "%02x", f[i]);
+            setProperty("MtkRxNonSnapHex", snapDiag);
+        }
+        rxNonSnap++;
+        return;
+    }
+    bool eapol = l[6] == 0x88 && l[7] == 0x8e;
+    if (!protFrame && tgtRsn && !eapol) {
         rxUnprotDrop++;                                               // plaintext data on a protected association
         return;
     }
@@ -599,8 +708,8 @@ void WTLWireless::publishW6() {
     snprintf(s, sizeof(s), "state %u joins %u fails %u last %u rejoins %u authtx %u assoctx %u tries %u", joinState, joins,
              joinFailures, lastResult, rejoins, authTx, assocTx, joinTries);
     setProperty("MtkW1Join", s);
-    snprintf(s, sizeof(s), "m1 %u m2 %u m3 %u m4 %u g1 %u g2 %u badmic %u replays %u reinst %u pnreplay %u nopn %u icv %u mismatch %u unprot %u portdrop %u trans %u eapol rx %u tx %u qdrop %u installs %u/%u",
-             supp.m1, supp.m2, supp.m3, supp.m4, supp.g1, supp.g2, supp.bad_mic, supp.replays, supp.reinstall_skipped, rxPnReplays, rxNoPn,
+    snprintf(s, sizeof(s), "m1 %u(%u) m2 %u(%u) m3 %u(%u) m4 %u(%u) g1 %u g2 %u badmic %u replays %u reinst %u pnreplay %u nopn %u icv %u mismatch %u unprot %u portdrop %u trans %u eapol rx %u tx %u qdrop %u installs %u/%u",
+             supp.m1, secM1Total + supp.m1, supp.m2, secM2Total + supp.m2, supp.m3, secM3Total + supp.m3, supp.m4, secM4Total + supp.m4, supp.g1, supp.g2, supp.bad_mic, supp.replays, supp.reinstall_skipped, rxPnReplays, rxNoPn,
              rxIcvErr, rxCipherMismatch, rxUnprotDrop, rxPortDrop, rxTransDrop, rxEapol, txEapolCount, eapolQDropped, secInstalls,
              secInstallFails);
     setProperty("MtkW2Sec", s);

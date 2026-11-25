@@ -146,14 +146,19 @@ private:
     void bssNote(const uint8_t *frame, uint32_t len, const char *ssid, uint8_t ssidLen, uint8_t ch, int8_t rssi);
     void bssNoteFrame(const uint8_t *f, uint32_t flen, int8_t rssi);
     static void bssParseSec(MtkBss &b);
-    static int8_t rxRssi(const uint8_t *p, uint32_t len, uint32_t rxd1);
-    static uint32_t rxFrameOffset(uint32_t rxd1, uint32_t rxd2);
+    int8_t rxRssi(const uint8_t *p, uint32_t len, uint32_t rxd1);
+    uint32_t rxFrameOffset(uint32_t rxd1, uint32_t rxd2);
     int bssScore(const MtkBss &b) const;
     bool bssJoinable(const MtkBss &b, bool withKey) const;
     void publishScan();
     void noteEvent(const uint8_t *p, uint32_t len);
     void macInitBand(int band);
     void dispatchRx(const uint8_t *p, uint32_t len);
+    uint32_t mdpBase(const MtkChip *c) const { return (c && c->id == 0x7902) ? 0x820cd000 : 0x820cc800; }
+    uint32_t mdpBnrcfr0(const MtkChip *c, int b) const { return mdpBase(c) + ((c && c->id == 0x7902) ? (0x070 + (b << 8)) : (0x090 + (b << 8))); }
+    uint32_t mdpBnrcfr1(const MtkChip *c, int b) const { return mdpBase(c) + ((c && c->id == 0x7902) ? (0x074 + (b << 8)) : (0x094 + (b << 8))); }
+    uint32_t rmacBase(int b) const { return b ? 0x820f5000 : 0x820e5000; }
+    void rxFilterPromisc();
 
     // MtkJoin.cpp: W5, and the W1 join machine + connection manager
     void noteMgmt(const uint8_t *p, uint32_t len);
@@ -162,6 +167,7 @@ private:
     int bssInfo(bool enable);
     int edca();
     int staRec(uint8_t state, bool newly, uint16_t aid);
+    int staBmcRec(bool enable, uint16_t aid);
     int staBa(uint8_t tid, uint16_t ssn, uint16_t win, bool tx, bool enable);
     int staKey(bool pairwise, uint8_t keyId, const uint8_t *key, uint8_t keyLen, bool add);
     int staRemove();
@@ -203,11 +209,16 @@ private:
     int ratePowerBand(bool is5g, int8_t halfDbm);
     int powerStage(bool afterDomain);
     int domainStage();
+    int ceCmd(uint8_t cid, uint8_t extCid, const void *payload, uint32_t plen, bool query = false,
+              bool wait = false, uint8_t *ev = nullptr, uint32_t evMax = 0, uint32_t *evLen = nullptr);
+    int waitMcuResp(uint8_t seq, uint8_t *ev, uint32_t evMax, uint32_t *evLen);
+    void macSetTiming(uint8_t ch);
     uint32_t domainChannels(uint8_t *ch, uint32_t *flags, uint32_t *n2);
     uint32_t coreChannels2(mtk_chan *list, uint32_t max);
     char country[3] = "US", countryWanted[3] = "US";   // 0.12.1: set_country, applied by the tick when no join runs
     bool countryPending = false;
     void countryService();
+    int chanSwitch(uint8_t ch, uint8_t center, uint8_t bw);
     int roc(bool acquire);
     void hwPrep();
     uint8_t *assocIes(uint8_t *p, bool ht);
@@ -330,6 +341,9 @@ private:
     // firmware command health: uniCmd never runs inside the RX path, and a dead firmware stops the machines
     bool inDispatch = false, fwDead = false;
     uint32_t uniCmdInDispatch = 0, uniCmdTimeouts = 0, uniCmdFails = 0;
+    uint32_t uniCmdErrStatus = 0;
+    uint16_t uniCmdErrCid = 0;
+    uint8_t eepromMac[6] = {};
     volatile uint32_t irqStatusOr = 0;
     uint32_t evCount[256] = {};
     uint32_t evShort = 0, evDumps = 0;
@@ -347,7 +361,8 @@ private:
     uint16_t tgtBcnInt = 0, tgtCap = 0;
     uint8_t tgtIe[512];
     uint32_t tgtIeLen = 0;
-    uint8_t apSupp = 0, apBasic = 0;
+    uint8_t apSupp = 0;
+    uint16_t apBasic = 0;
     uint8_t wantFc = 0;
     uint8_t mgmt[512];
     uint32_t mgmtLen = 0;
@@ -394,6 +409,7 @@ private:
     uint8_t pendingTk[16] = {}, pendingGtk[32] = {}, pendingGtkLen = 0, pendingGtkId = 0, pendingGtkRsc[8] = {};
     int32_t eapolSlot = -1;                    // TX slot of the last EAPOL frame we sent, -1 = freed
     uint32_t eapolSentAt = 0, secInstalls = 0, secInstallFails = 0;
+    uint32_t secM1Total = 0, secM2Total = 0, secM3Total = 0, secM4Total = 0;
     // CCMP replay counters (mt76_check_ccmp_pn): 0-7 pairwise by TID, 8-15 group by TID; reset on key install
     uint64_t rxPn[16] = {};
     uint32_t rxPnReplays = 0;
@@ -456,6 +472,9 @@ private:
     bool rxBaOn = true, txBaOn = true;         // MtkRxBa / MtkTxBa in Info.plist
     bool powerOn = true;                       // MtkPower in Info.plist
     int clcResult = 0;
+    uint8_t nicNss = 1;                        // real TX/RX stream count from GET_NIC_CAPAB (0x8a) on ConNaC2
+    uint64_t nicChipCap = 0;                   // MT_NIC_CAP_CHIP_CAP (32) from GET_NIC_CAPAB (0x8a)
+    int mcuRegRead(uint32_t addr);             // mt76_connac_mcu_reg_rr (MCU_CE_QUERY(REG_READ))
     MtkRxTid rxTid[8] = {};
     uint8_t txBaState = 0;                     // 0 none, 1 requested, 2 operational, 3 refused
     uint8_t txBaDialog = 0;

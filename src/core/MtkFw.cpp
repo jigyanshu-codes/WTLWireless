@@ -201,7 +201,7 @@ int WTLWireless::mcuCmd(uint8_t cid, const void *payload, uint32_t plen) {
     uint8_t seq = nextSeq();
     uint32_t total = MCU_TXD_LEN + plen;
     uint32_t txd0 = (total & 0xffff) | (2u << 23) | (0x20u << 25); // TX_BYTES, PKT_FMT CMD, Q_IDX MCU_PORT_RX_Q0
-    uint32_t txd1 = 1u << 14;                                        // HDR_FORMAT CMD (connac3 bits 15:14)
+    uint32_t txd1 = chip ? chip->txdHdrFormat : (1u << 14); // HDR_FORMAT CMD (connac2: bits 31, 16; connac3: bit 14)
     OSWriteLittleInt32(msg, 0, txd0);
     OSWriteLittleInt32(msg, 4, txd1);
     OSWriteLittleInt16(msg, 32, (uint16_t)(total - 32)); // len: everything after txd[8]
@@ -223,8 +223,10 @@ int WTLWireless::mcuWait(uint8_t cid, uint8_t seq) {
         const uint8_t *p = rxPoll(rxMcu, &len);
         if (!p) { IOSleep(1); continue; }
         rxEvents++;
-        bool match = len > MCU_RXD_STATUS && p[MCU_RXD_SEQ] == seq;
-        int status = (len > MCU_RXD_STATUS) ? p[MCU_RXD_STATUS] : -1;
+        uint8_t seqOfs = chip ? chip->mcuRxdSeq : MCU_RXD_SEQ;
+        uint8_t statOfs = chip ? chip->mcuRxdStatus : MCU_RXD_STATUS;
+        bool match = len > statOfs && p[seqOfs] == seq;
+        int status = (len > statOfs) ? p[statOfs] : -1;
         rxRelease(rxMcu);
         if (!match) { rxUnmatched++; continue; }
         if (cid == CMD_PATCH_SEM_CONTROL || cid == CMD_PATCH_FINISH_REQ)
@@ -381,9 +383,10 @@ int WTLWireless::hwStart() {
     };
     if ((e = ring(txData, false, TXQ_BAND0, 1024, 2048)))  { setNum("MtkW2RingFail", 100 + e); step("W2 fail: ring alloc"); return -3; }
     rawWrite(TX_RING0_EXT_CTRL, 0x4);
-    if ((e = ring(txMcu, false, TXQ_MCU_WM, 32, 2048)))  { setNum("MtkW2RingFail", 200 + e); step("W2 fail: ring alloc"); return -3; }
+    if ((e = ring(txMcu, false, TXQ_MCU_WM, 256, 2048)))  { setNum("MtkW2RingFail", 200 + e); step("W2 fail: ring alloc"); return -3; }
     if ((e = ring(txFwdl, false, TXQ_FWDL, 32, 4096)))   { setNum("MtkW2RingFail", 300 + e); step("W2 fail: ring alloc"); return -3; }
-    if ((e = ring(rxMcu, true, chip->rxqMcu, 128, 2048)))   { setNum("MtkW2RingFail", 400 + e); step("W2 fail: ring alloc"); return -3; }
+    uint16_t rxMcuN = (chip && chip->id == 0x7902) ? 512 : 128;
+    if ((e = ring(rxMcu, true, chip->rxqMcu, rxMcuN, 2048))) { setNum("MtkW2RingFail", 400 + e); step("W2 fail: ring alloc"); return -3; }
     if ((e = ring(rxData, true, chip->rxqData, 512, 2048)))   { setNum("MtkW2RingFail", 500 + e); step("W2 fail: ring alloc"); return -3; }
     if (chip->rxqWa && (e = ring(rxWa, true, chip->rxqWa, 512, 2048))) { setNum("MtkW2RingFail", 600 + e); step("W2 fail: ring alloc"); return -3; }
     setNum("MtkW2RxMcuIova", rxMcu.desc.iova);

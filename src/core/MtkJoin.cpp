@@ -25,8 +25,8 @@ constexpr uint32_t WTBL_UPDATE = 0x820d4380, WTBL_ITCR = 0x820d43b0, WTBL_ITDR0 
 constexpr uint16_t STA_REC_KEY_V3 = 0x27;                     // struct sta_rec_sec_uni
 constexpr uint8_t CIPHER_NONE = 0, CIPHER_TKIP = 2, CIPHER_CCMP = 4;   // CONNAC3_CIPHER_*
 constexpr uint8_t SEC_MODE_OPEN = 0, SEC_MODE_WPA2_PSK = 7;            // mt7925.h MODE_*
-constexpr uint32_t JOIN_PHASE_TICKS = 150, JOIN_ROC_TICKS = 1000, JOIN_HANDSHAKE_TICKS = 10000;
-constexpr int JOIN_TRIES = 4;
+constexpr uint32_t JOIN_PHASE_TICKS = 1000, JOIN_ROC_TICKS = 1000, JOIN_HANDSHAKE_TICKS = 10000;
+constexpr int JOIN_TRIES = 6;
 constexpr uint32_t CM_PERIOD_TICKS = 100, CM_IDLE_RESCAN_TICKS = 15000, CM_WANT_RESCAN_TICKS = 5000,
                    CM_WANT_RESCAN_SLOW_TICKS = 15000, CM_WANT_FALLBACK_TICKS = 30000, CM_USER_SCAN_GRACE_TICKS = 10000,
                    CM_BOOT_GRACE_TICKS = 20000, CM_ONFALLBACK_RESCAN_TICKS = 30000, CM_BACKOFF_MAX_TICKS = 60000;
@@ -43,6 +43,7 @@ void safeSsid(const char *in, uint8_t len, char out[33]) {
 }
 
 inline uint16_t le16(const uint8_t *p) { return (uint16_t)(p[1] << 8 | p[0]); }
+inline uint32_t le32(const uint8_t *p) { return (uint32_t)p[3] << 24 | (uint32_t)p[2] << 16 | (uint32_t)p[1] << 8 | p[0]; }
 inline void put16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
 inline void put32(uint8_t *p, uint32_t v) { for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i)); }
 
@@ -59,6 +60,25 @@ struct Msg {
         put16(b + 2, (uint16_t)(le16(b + 2) + 1));
         return p;
     }
+    // Nested ConNaC2 STA_REC_WTBL container (tag 0x0d) + wtbl_req_hdr (8 bytes); returns wtbl_req_hdr*
+    uint8_t *wtblInit(uint16_t wcid, uint8_t op, uint8_t **wtblOut) {
+        uint8_t *wtbl = tlv(0x0d, 12);          // tag 0x0d, initial len = sizeof(tlv) + sizeof(wtbl_req_hdr)
+        uint8_t *wh = wtbl + 4;
+        wh[0] = wcid & 0xff;
+        wh[1] = op;                             // 1 = WTBL_RESET_AND_SET, 2 = WTBL_SET
+        wh[4] = (uint8_t)(wcid >> 8);
+        if (wtblOut) *wtblOut = wtbl;
+        return wh;
+    }
+    uint8_t *wtblTlv(uint8_t *wtbl, uint8_t *wh, uint16_t tag, uint16_t len) {
+        uint8_t *p = b + n;
+        put16(p, tag);
+        put16(p + 2, len);
+        n += len;
+        put16(wh + 2, (uint16_t)(le16(wh + 2) + 1));
+        put16(wtbl + 2, (uint16_t)(le16(wtbl + 2) + len));
+        return p;
+    }
 };
 
 const char *resultName(uint32_t r) {
@@ -72,29 +92,77 @@ const char *resultName(uint32_t r) {
 
 // While waiting for an auth / assoc response: a management frame from the AP to us with fc byte 0 == wantFc
 void WTLWireless::noteMgmt(const uint8_t *p, uint32_t len) {
-    if (!wantFc || mgmtLen || len < 32 + 24) return;
-    for (uint32_t off = 32; off + 24 <= len && off < 224; off++) {
-        if (p[off] != wantFc) continue;
-        if (memcmp(p + off + 4, mac, 6) != 0 || memcmp(p + off + 10, tgtBssid, 6) != 0) continue;
+    if (!wantFc || mgmtLen || len < 32) return;
+    uint32_t rxd1 = le32(p + 4), rxd2 = le32(p + 8);
+    uint32_t fOff = rxFrameOffset(rxd1, rxd2);
+
+    if (fOff + 24 <= len) {
+        uint8_t fc0 = p[fOff];
+        if ((fc0 & 0x0c) == 0 && fc0 != 0x80) {
+            char diag[80];
+            snprintf(diag, sizeof(diag), "rx fc 0x%02x off %u da %02x:%02x:%02x:%02x:%02x:%02x sa %02x:%02x:%02x:%02x:%02x:%02x",
+                     fc0, fOff,
+                     p[fOff+4], p[fOff+5], p[fOff+6], p[fOff+7], p[fOff+8], p[fOff+9],
+                     p[fOff+10], p[fOff+11], p[fOff+12], p[fOff+13], p[fOff+14], p[fOff+15]);
+            setProperty("MtkLastJoinRxMgmt", diag);
+        }
+
+        if (fc0 == wantFc || (wantFc == 0x10 && (fc0 == 0x10 || fc0 == 0x30))) {
+            bool daMatch = (memcmp(p + fOff + 4, mac, 6) == 0) || (p[fOff + 4] == 0xff);
+            bool saMatch = (memcmp(p + fOff + 10, tgtBssid, 6) == 0) || (memcmp(p + fOff + 16, tgtBssid, 6) == 0);
+            if (daMatch && saMatch) {
+                uint32_t n = len - fOff;
+                if (n > sizeof(mgmt)) n = sizeof(mgmt);
+                memcpy(mgmt, p + fOff, n);
+                mgmtLen = (uint16_t)n;
+                char mDiag[64];
+                snprintf(mDiag, sizeof(mDiag), "matched fc 0x%02x at off %u len %u", fc0, fOff, n);
+                setProperty("MtkMgmtMatch", mDiag);
+                return;
+            }
+        }
+    }
+
+    for (uint32_t off = 24; off + 24 <= len && off < 224; off++) {
+        bool fcMatch = (p[off] == wantFc) || (wantFc == 0x10 && (p[off] == 0x10 || p[off] == 0x30));
+        if (!fcMatch) continue;
+        char hex[64] = {};
+        snprintf(hex, sizeof(hex), "seen wantFc %02x off %u da %02x:%02x:%02x:%02x:%02x:%02x",
+                 wantFc, off, p[off+4], p[off+5], p[off+6], p[off+7], p[off+8], p[off+9]);
+        setProperty("MtkLastSeenFc", hex);
+        if (memcmp(p + off + 4, mac, 6) != 0 && (p[off + 4] != 0xff)) continue;
+        if (memcmp(p + off + 10, tgtBssid, 6) != 0 && memcmp(p + off + 16, tgtBssid, 6) != 0) continue;
+        char matchHex[48] = {};
+        snprintf(matchHex, sizeof(matchHex), "fc %02x off %u da %02x%02x sa %02x%02x",
+                 p[off], off, p[off+4], p[off+5], p[off+10], p[off+11]);
+        setProperty("MtkMgmtMatch", matchHex);
         uint32_t n = len - off;
         if (n > sizeof(mgmt)) n = sizeof(mgmt);
         memcpy(mgmt, p + off, n);
-        mgmtLen = n;
+        mgmtLen = (uint16_t)n;
         return;
     }
 }
 
 void WTLWireless::parseAp() {
     static const uint8_t r5g[8] = {12, 18, 24, 36, 48, 72, 96, 108};   // 500 kb/s units, mac80211 5 GHz indices
+    static const uint8_t r2g[4] = {2, 4, 11, 22};                       // CCK 1, 2, 5.5, 11 Mbps
     apSupp = apBasic = 0;
     for (const uint8_t *ie = tgtIe, *end = tgtIe + tgtIeLen; ie + 2 <= end && ie + 2 + ie[1] <= end; ie += 2 + ie[1]) {
         if (ie[0] != 1 && ie[0] != 50) continue;
-        for (int i = 0; i < ie[1]; i++)
+        for (int i = 0; i < ie[1]; i++) {
+            uint8_t r = ie[2 + i] & 0x7f;
+            bool basic = (ie[2 + i] & 0x80) != 0;
             for (int k = 0; k < 8; k++)
-                if ((ie[2 + i] & 0x7f) == r5g[k]) {
+                if (r == r5g[k]) {
                     apSupp |= (uint8_t)(1u << k);
-                    if (ie[2 + i] & 0x80) apBasic |= (uint8_t)(1u << k);
+                    if (basic) apBasic |= (uint16_t)(1u << k);
                 }
+            if (tgtCh <= 14) {
+                for (int k = 0; k < 4; k++)
+                    if (r == r2g[k] && basic) apBasic |= (uint16_t)(1u << (k + 8));
+            }
+        }
     }
     apHt = apVht = false;
     uint8_t vhtWidth = 0;
@@ -118,6 +186,7 @@ void WTLWireless::parseAp() {
     }
     if (tgtCh <= 14) apVht = false;
     apNss = (apRxMcs[1] || (apVht && ((apVhtRx >> 2) & 3) != 3)) ? 2 : 1;
+    if (nicNss && apNss > nicNss) apNss = nicNss;
     chBw = 0;
     chCenter = tgtCh;
     if (apHt && (apHtOp & 4) && (apHtOp & 3)) {        // 40 MHz: secondary above (1) or below (3)
@@ -142,8 +211,8 @@ int WTLWireless::bssInfo(bool enable) {
     m.b[0] = BSS_IDX;
     uint8_t *b = m.tlv(0, 32);                  // UNI_BSS_INFO_BASIC
     b[4] = 1;                                   // active
-    // band_idx: 0xff, MT7927 takes the band of the channel (mt7927_band_idx: 2.4 GHz 0, 5 and 6 GHz 1)
-    b[7] = (chip->quirks & MTK_Q_BAND_IDX) ? (tgtCh > 14 ? 1 : 0) : 0xff;
+    // band_idx: 0 for MT7902 (single band 0); MT7927 takes the band of the channel
+    b[7] = (chip && chip->id == 0x7902) ? 0 : ((chip && (chip->quirks & MTK_Q_BAND_IDX)) ? (tgtCh > 14 ? 1 : 0) : 0xff);
     put32(b + 8, 0x10001);                      // CONNECTION_INFRA_STA
     b[12] = enable ? 0 : 1;                     // conn_state
     memcpy(b + 14, tgtBssid, 6);
@@ -152,37 +221,43 @@ int WTLWireless::bssInfo(bool enable) {
     b[24] = 1;                                  // dtim_period
     b[25] = tgtCh > 14 ? (uint8_t)(0x01 | (htActive ? 0x10 : 0) | (vhtActive ? 0x20 : 0))     // A | AN | AC
                        : (uint8_t)(0x02 | 0x04 | (htActive ? 0x08 : 0));                      // B | G | GN
-    put16(b + 26, AP_WCID);
-    put16(b + 28, tgtCh > 14 ? 3 : 1);          // nonht_basic_phy: OFDM / ERP
-    uint8_t *s = m.tlv(16, 8);                  // UNI_BSS_INFO_SEC (mt7925_mcu_bss_sec_tlv): mode, status, cipher
-    if (secCipher == CIPHER_CCMP) { s[4] = SEC_MODE_WPA2_PSK; s[5] = 6; s[6] = CIPHER_CCMP; }
-    else { s[4] = SEC_MODE_OPEN; s[5] = 1; s[6] = CIPHER_NONE; }
+    bool is7902 = (chip && chip->id == 0x7902);
+    put16(b + 26, is7902 ? BMC_WCID : AP_WCID);
+    put16(b + 28, tgtCh > 14 ? 8 : 3);          // nonht_basic_phy: OFDM (8) / HR_DSSS|ERP (3)
+    if (!is7902) {
+        uint8_t *s = m.tlv(16, 8);              // UNI_BSS_INFO_SEC (mt7925_mcu_bss_sec_tlv): mode, status, cipher
+        if (secCipher == CIPHER_CCMP) { s[4] = SEC_MODE_WPA2_PSK; s[5] = 6; s[6] = CIPHER_CCMP; }
+        else { s[4] = SEC_MODE_OPEN; s[5] = 1; s[6] = CIPHER_NONE; }
+    }
     uint8_t *r = m.tlv(11, 16);                 // UNI_BSS_INFO_RATE
     put16(r + 6, (1 << 6) | (1 << 8) | (1 << 10));   // OFDM basic rates 6/12/24
     r[13] = RATE_IDX_OFDM6;                     // bc_fixed_rate
     r[14] = RATE_IDX_OFDM6;                     // mc_fixed_rate
     uint8_t *q = m.tlv(15, 8);                  // UNI_BSS_INFO_QBSS
     q[4] = 1;
-    uint8_t *ml = m.tlv(26, 20);                // UNI_BSS_INFO_MLD
-    ml[4] = 0xff;
-    ml[5] = BSS_IDX + 32;
-    memcpy(ml + 6, mac, 6);
-    ml[12] = 0xff;
-    ml[13] = 0xff;
+    if (!(chip && chip->id == 0x7902)) {
+        uint8_t *ml = m.tlv(26, 20);                // UNI_BSS_INFO_MLD
+        ml[4] = 0xff;
+        ml[5] = BSS_IDX + 32;
+        memcpy(ml + 6, mac, 6);
+        ml[12] = 0xff;
+        ml[13] = 0xff;
+    }
     uint8_t *f = m.tlv(23, 20);                 // UNI_BSS_INFO_IFS_TIME
     f[4] = 1;
     put16(f + 8, 9);
-    if (enable) {
-        uint8_t *rl = m.tlv(2, 16);             // UNI_BSS_INFO_RLM (mt7925_mcu_bss_rlm_tlv)
-        uint8_t bw = htActive ? chBw : 0, center = bw ? chCenter : tgtCh;
-        rl[4] = tgtCh;
-        rl[5] = center;
-        rl[7] = bw;
-        rl[8] = rl[9] = htActive ? 2 : 1;      // tx / rx streams (antenna mask 0x3)
-        rl[10] = bw ? 4 : 0;                    // ht_op_info: 40 MHz allowed
-        rl[11] = tgtCh < center ? 1 : tgtCh > center ? 3 : 0;   // sco: SCA / SCB
-        rl[12] = tgtCh > 14 ? 2 : 1;
-    }
+    uint8_t *rl = m.tlv(2, 16);                 // UNI_BSS_INFO_RLM (mt76_connac_mcu_uni_set_chctx)
+    uint8_t bw = chBw, center = chCenter;
+    rl[4] = tgtCh;
+    rl[5] = center;
+    rl[6] = 0;                                  // center_chan2
+    rl[7] = bw;
+    rl[8] = nicNss ? nicNss : 1;                // tx_streams
+    rl[9] = nicNss ? nicNss : 1;                // rx_streams
+    rl[10] = 1;                                 // short_st = true
+    rl[11] = bw ? 4 : 0;                        // ht_op_info: 40 MHz allowed
+    rl[12] = tgtCh < center ? 1 : tgtCh > center ? 3 : 0;   // sco: SCA / SCB
+    rl[13] = tgtCh > 14 ? 1 : 0;                // band: 0 for 2.4GHz, 1 for 5GHz
     int rc = uniCmd(UNI_BSS_INFO_UPDATE, m.b, m.n, false, nullptr, 0, nullptr);
     edca();
     return rc;
@@ -232,20 +307,23 @@ int WTLWireless::staRec(uint8_t state, bool newly, uint16_t aidArg) {
     m.b[6] = AP_WCID >> 8;
     uint8_t *b = m.tlv(0, 20);                  // STA_REC_BASIC
     put32(b + 4, 0x10002);                      // CONNECTION_INFRA_AP
-    b[8] = 2;                                   // CONN_STATE_PORT_SECURE
+    b[8] = (state == 2) ? 2 : 1;                // conn_state: 1 = CONNECT (authenticating), 2 = PORT_SECURE (associated)
     b[9] = 1;                                   // qos
     put16(b + 10, aidArg);
     memcpy(b + 12, tgtBssid, 6);
     put16(b + 18, newly ? 3 : 1);               // EXTRA_INFO_VER | NEW
+    bool is7902 = (chip && chip->id == 0x7902);
     bool ht = state && htActive, vht = state && vhtActive;
+    uint8_t af = 0, mm = 0;
     uint8_t *p = m.tlv(0x15, 12);               // STA_REC_PHY
     put16(p + 4, apBasic);
-    p[6] = (uint8_t)((1u << 3) | (ht ? 1u << 4 : 0) | (vht ? 1u << 5 : 0));   // PHY_TYPE_BIT_OFDM | HT | VHT
+    p[6] = (uint8_t)((tgtCh > 14 ? (1u << 3) : ((1u << 0) | (1u << 1))) | (ht ? 1u << 4 : 0) | (vht ? 1u << 5 : 0));
     if (ht) {
-        uint8_t af = apAmpdu & 3, mm = (apAmpdu >> 2) & 7;
+        af = apAmpdu & 3;
+        mm = (apAmpdu >> 2) & 7;
         if (vht && ((apVhtCap >> 23) & 7) > af) af = (apVhtCap >> 23) & 7;
         p[7] = (uint8_t)(af | (mm << 2));       // ampdu: factor | density
-        p[10] = af;                             // max_ampdu_len
+        if (!is7902) p[10] = af;                // max_ampdu_len (ConNaC3 only)
     }
     // Linux mt7925_mcu_sta_cmd order: BASIC, PHY, HT, VHT, ..., RA, STATE, MLD, HDR_TRANS
     if (ht) {
@@ -260,29 +338,107 @@ int WTLWireless::staRec(uint8_t state, bool newly, uint16_t aidArg) {
         put16(v + 10, (uint16_t)(apVhtTx | 0xfff0));
     }
     uint8_t *ra = m.tlv(1, 16);                 // STA_REC_RA
-    put16(ra + 4, (uint16_t)(apSupp << 6));     // RA_LEGACY_OFDM
-    if (ht) { ra[6] = apRxMcs[0]; ra[7] = apNss > 1 ? apRxMcs[1] : 0; }   // HT MCS the AP can receive
-    uint8_t *st = m.tlv(7, 16);                 // STA_REC_STATE (v2)
-    st[4] = state;
-    if (vht) st[12] = (uint8_t)(chBw | (apNss << 4));                      // vht_opmode: bandwidth | rx_nss
-    if (state) {
-        uint8_t *ml = m.tlv(0x20, 28);          // STA_REC_MLD
-        memcpy(ml + 4, tgtBssid, 6);
-        put16(ml + 10, AP_WCID);
-        put16(ml + 14, AP_WCID);
-        ml[16] = 1;
-        put16(ml + 20, AP_WCID);
-        ml[22] = BSS_IDX;
+    uint16_t raLegacy = (uint16_t)(apSupp << 6); // RA_LEGACY_OFDM
+    if (tgtCh <= 14) {
+        uint8_t cckSupp = (uint8_t)((apBasic >> 8) & 0x0f);
+        if (!cckSupp) cckSupp = 0x0f;           // all 4 CCK rates
+        raLegacy |= cckSupp;                    // RA_LEGACY_CCK: bits 3:0
     }
-    uint8_t *h = m.tlv(0x2b, 8);                // STA_REC_HDR_TRANS: from_ds 0, to_ds 1, no RX header translation
-    h[5] = 1;
-    h[6] = 1;
+    put16(ra + 4, raLegacy);
+    if (ht) { ra[6] = apRxMcs[0]; ra[7] = apNss > 1 ? apRxMcs[1] : 0; }   // HT MCS the AP can receive
+    if (is7902) {
+        uint8_t *st = m.tlv(7, 12);             // STA_REC_STATE (ConNaC2: struct sta_rec_state, 12 bytes)
+        st[8] = (state == 2) ? 2 : 1;           // state at offset 8
+        if (vht) st[9] = (uint8_t)(chBw | ((apNss ? apNss - 1 : 0) << 4));   // vht_opmode at offset 9
+        // ConNaC2 WTBL configuration (mt76_connac_mcu_sta_cmd): WTBL_RESET_AND_SET (1)
+        uint8_t *wtbl = nullptr;
+        uint8_t *wh = m.wtblInit(AP_WCID, 1, &wtbl);
+        uint8_t *g = m.wtblTlv(wtbl, wh, 0, 20);   // WTBL_GENERIC
+        memcpy(g + 4, tgtBssid, 6);
+        g[10] = 0;                              // muar_idx
+        g[13] = ht ? 1 : 0;                     // qos
+        put16(g + 16, state == 2 ? aidArg : 0); // partial_aid
+        uint8_t *wrx = m.wtblTlv(wtbl, wh, 1, 12); // WTBL_RX
+        wrx[5] = 1;                             // rca1
+        wrx[6] = 1;                             // rca2
+        wrx[7] = 1;                             // rv
+        uint8_t *htr = m.wtblTlv(wtbl, wh, 6, 8);  // WTBL_HDR_TRANS
+        htr[4] = 1;                             // to_ds
+        htr[5] = 0;                             // from_ds
+        htr[6] = 1;                             // no_rx_trans: deliver 802.11 frames without HW decap
+        if (ht) {
+            uint8_t *wht = m.wtblTlv(wtbl, wh, 2, 12); // WTBL_HT
+            wht[4] = 1;                         // ht
+            wht[5] = (apHtCap & 0x0001) ? 1 : 0; // ldpc
+            wht[6] = af;
+            wht[7] = mm;
+            if (vht) {
+                uint8_t *wvht = m.wtblTlv(wtbl, wh, 3, 12); // WTBL_VHT
+                wvht[4] = (apVhtCap & 0x0010) ? 1 : 0; // ldpc
+                wvht[6] = 1;                    // vht
+            }
+            m.wtblTlv(wtbl, wh, 13, 8);         // WTBL_SMPS (smps = 0)
+        }
+    } else {
+        uint8_t *st = m.tlv(7, 16);             // STA_REC_STATE (v2, ConNaC3)
+        st[4] = (state == 2) ? 2 : 1;           // 1 = MT76_STA_INFO_STATE_AUTH, 2 = MT76_STA_INFO_STATE_ASSOC
+        if (vht) st[12] = (uint8_t)(chBw | (apNss << 4));                      // vht_opmode: bandwidth | rx_nss
+        if (state) {
+            uint8_t *ml = m.tlv(0x20, 28);      // STA_REC_MLD
+            memcpy(ml + 4, tgtBssid, 6);
+            put16(ml + 10, AP_WCID);
+            put16(ml + 14, AP_WCID);
+            ml[16] = 1;
+            put16(ml + 20, AP_WCID);
+            ml[22] = BSS_IDX;
+        }
+        uint8_t *h = m.tlv(0x2b, 8);            // STA_REC_HDR_TRANS: from_ds 0, to_ds 1, no RX header translation
+        h[5] = 1;
+        h[6] = 1;
+    }
+    return uniCmd(UNI_STA_REC_UPDATE, m.b, m.n, false, nullptr, 0, nullptr);
+}
+
+// ConNaC2 (MT7902) broadcast/multicast WCID (BMC_WCID = 19, muar_idx 0x0e) station record for GTK decryption
+int WTLWireless::staBmcRec(bool enable, uint16_t aidArg) {
+    Msg m;
+    m.init(8);
+    m.b[0] = BSS_IDX;
+    m.b[1] = BMC_WCID & 0xff;
+    m.b[4] = 1;                                 // is_tlv_append
+    m.b[5] = 0x0e;                              // muar_idx = 0xe for BMC record
+    m.b[6] = BMC_WCID >> 8;
+    uint8_t *b = m.tlv(0, 20);                  // STA_REC_BASIC
+    put32(b + 4, 0x00010020);                   // CONNECTION_INFRA_BC (STA_TYPE_BC | NETWORK_INFRA)
+    b[8] = enable ? 2 : 0;                      // CONN_STATE_PORT_SECURE / DISCONNECT
+    b[9] = 0;
+    if (enable) {
+        put16(b + 10, aidArg);
+        memcpy(b + 12, tgtBssid, 6);
+    }
+    put16(b + 18, enable ? 3 : 1);              // EXTRA_INFO_VER | EXTRA_INFO_NEW
+    uint8_t *wtbl = nullptr;
+    uint8_t *wh = m.wtblInit(BMC_WCID, 1, &wtbl); // WTBL_RESET_AND_SET
+    if (enable) {
+        uint8_t *g = m.wtblTlv(wtbl, wh, 0, 20); // WTBL_GENERIC
+        memcpy(g + 4, tgtBssid, 6);
+        g[10] = 0x0e;                           // muar_idx
+        uint8_t *wrx = m.wtblTlv(wtbl, wh, 1, 12); // WTBL_RX
+        wrx[5] = 1;                             // rca1
+        wrx[6] = 1;                             // rca2
+        wrx[7] = 1;                             // rv
+        uint8_t *htr = m.wtblTlv(wtbl, wh, 6, 8);  // WTBL_HDR_TRANS
+        htr[4] = 1;                             // to_ds
+        htr[5] = 0;                             // from_ds
+        htr[6] = 1;                             // no_rx_trans
+    }
     return uniCmd(UNI_STA_REC_UPDATE, m.b, m.n, false, nullptr, 0, nullptr);
 }
 
 // The disable form of the station record (mt76_connac_mcu_sta_basic_tlv with enable = false): conn_state
 // DISCONNECT, extra info VER only. Sent when we leave or lose the AP, before the next joinStart adds a new record.
 int WTLWireless::staRemove() {
+    bool is7902 = (chip && chip->id == 0x7902);
     Msg m;
     m.init(8);
     m.b[0] = BSS_IDX;
@@ -296,12 +452,40 @@ int WTLWireless::staRemove() {
     put16(b + 10, 0);
     memcpy(b + 12, tgtBssid, 6);
     put16(b + 18, 1);                           // EXTRA_INFO_VER
-    return uniCmd(UNI_STA_REC_UPDATE, m.b, m.n, false, nullptr, 0, nullptr);
+    if (is7902) m.wtblInit(AP_WCID, 1, nullptr); // WTBL_RESET_AND_SET
+    int rc = uniCmd(UNI_STA_REC_UPDATE, m.b, m.n, false, nullptr, 0, nullptr);
+    if (is7902) staBmcRec(false, 0);
+    return rc;
 }
 
 // STA_REC_BA (mt7925_mcu_sta_ba): tid, ba_type (1 originator, 2 recipient), amsdu, ba_en = enable << tid,
 // ssn, winsize
 int WTLWireless::staBa(uint8_t tid, uint16_t ssn, uint16_t win, bool tx, bool enable) {
+    if (chip && chip->id == 0x7902) {
+        Msg wm;
+        wm.init(8);
+        wm.b[0] = BSS_IDX;
+        wm.b[1] = AP_WCID & 0xff;
+        wm.b[4] = 1;
+        wm.b[6] = AP_WCID >> 8;
+        uint8_t *wtbl = nullptr;
+        uint8_t *wh = wm.wtblInit(AP_WCID, 2, &wtbl); // WTBL_SET = 2
+        uint8_t *wba = wm.wtblTlv(wtbl, wh, 8, 28);    // WTBL_BA = 8, sizeof(struct wtbl_ba) = 28
+        wba[4] = tid;
+        wba[5] = tx ? 1 : 2;                    // MT_BA_TYPE_ORIGINATOR / RECIPIENT
+        put16(wba + 12, enable ? win : 0);      // ba_winsize
+        if (tx) {
+            put16(wba + 8, enable ? ssn : 0);
+            wba[10] = enable ? 1 : 0;           // ba_en
+        } else {
+            memcpy(wba + 14, tgtBssid, 6);      // peer_addr
+            wba[20] = tid;                      // rst_ba_tid
+            wba[21] = 0;                        // rst_ba_sel = RST_BA_MAC_TID_MATCH
+            wba[22] = 1;                        // rst_ba_sb
+        }
+        int wrc = uniCmd(UNI_STA_REC_UPDATE, wm.b, wm.n, false, nullptr, 0, nullptr);
+        if (wrc) return wrc;
+    }
     Msg m;
     m.init(8);
     m.b[0] = BSS_IDX;
@@ -331,6 +515,33 @@ int WTLWireless::staKey(bool pairwise, uint8_t keyId, const uint8_t *key, uint8_
     m.b[4] = 1;                                 // is_tlv_append
     m.b[5] = pairwise ? 0 : 0x0e;               // muar_idx: omac 0 for a station, 0xe for the broadcast record
     m.b[6] = wcid >> 8;
+    if (chip && chip->id == 0x7902) {
+        // ConNaC2 (MT7902 / MT7921): STA_REC_KEY_V2 (tag 0x11 = 17, len = 44 on SET_KEY or 8 on DISABLE_KEY)
+        // struct sta_rec_sec (mt76_connac_mcu.h):
+        //   u8 add (Linux enum set_key_cmd: SET_KEY = 0, DISABLE_KEY = 1)
+        //   u8 n_cipher (1 on SET_KEY, 0 on DISABLE_KEY)
+        //   u8 rsv[2]
+        //   struct sec_key { u8 cipher_id; u8 cipher_len(36); u8 key_id; u8 key_len; u8 key[32]; }
+        uint8_t *k = m.tlv(0x11, add ? 44 : 8);
+        k[4] = add ? 0 : 1;                     // SET_KEY = 0, DISABLE_KEY = 1 in mt76_connac_mcu_sta_key_tlv
+        k[5] = add ? 1 : 0;                     // n_cipher = 1 when adding, 0 when deleting
+        k[6] = 0;
+        k[7] = 0;
+        if (add) {
+            k[8] = (keyLen == 32) ? 4 : 5;     // MCU_CIPHER_AES_CCMP = 5, MCU_CIPHER_TKIP = 4
+            k[9] = 36;                         // cipher_len = sizeof(sec_key)
+            k[10] = keyId;
+            k[11] = keyLen;
+            memcpy(k + 12, key, keyLen);
+            if (keyLen == 32) {
+                memcpy(k + 12 + 16, key + 24, 8);
+                memcpy(k + 12 + 24, key + 16, 8);
+            }
+        }
+        int rc = uniCmd(UNI_STA_REC_UPDATE, m.b, m.n, false, nullptr, 0, nullptr);
+        mtk_zero(m.b, sizeof(m.b));
+        return rc;
+    }
     uint8_t *k = m.tlv(STA_REC_KEY_V3, 68);
     k[4] = add ? 1 : 0;                         // add
     k[5] = pairwise ? 1 : 0;                    // tx_key
@@ -355,6 +566,52 @@ int WTLWireless::staKey(bool pairwise, uint8_t keyId, const uint8_t *key, uint8_
     return rc;
 }
 
+// Channel switch command (MCU_EXT_CMD_CHANNEL_SWITCH 0x08 on EXT_CID 0xed)
+int WTLWireless::chanSwitch(uint8_t ch, uint8_t center, uint8_t bw) {
+    if (chip && chip->id == 0x7902) {
+        uint8_t msg[64 + 76];
+        bzero(msg, sizeof(msg));
+        uint32_t total = sizeof(msg);
+        uint32_t txd0 = (total & 0xffff) | (2u << 23) | (0x20u << 25);
+        uint32_t txd1 = chip->txdHdrFormat ? chip->txdHdrFormat : ((1u << 31) | (1u << 16));
+        put32(msg + 0, txd0);
+        put32(msg + 4, txd1);
+        put16(msg + 32, (uint16_t)(total - 32));
+        put16(msg + 34, 0x8000); // pq_id: MCU_PQ_ID(MT_TX_PORT_IDX_MCU, RX_Q0)
+        msg[36] = 0xed;          // MCU_CMD_EXT_CID
+        msg[37] = 0xa0;          // MCU_PKT_ID
+        msg[38] = 1;             // set_query: MCU_Q_SET
+        uint8_t seq = nextSeq();
+        msg[39] = seq;
+        msg[40] = 0;             // uc_d2b0_rev
+        msg[41] = 0x08;          // ext_cid: MCU_EXT_CMD_CHANNEL_SWITCH
+        msg[42] = 0;             // s2d_index: MCU_S2D_H2N
+        msg[43] = 1;             // ext_cid_ack: 1
+
+        uint8_t *req = msg + 64;
+        req[0] = ch;             // control_ch
+        req[1] = center;         // center_ch
+        req[2] = bw;             // bw
+        req[3] = nicNss ? nicNss : 1; // tx_streams_num
+        req[4] = nicNss ? nicNss : 1; // rx_streams
+        req[5] = 0;              // switch_reason: CH_SWITCH_NORMAL
+        req[6] = 0;              // band_idx
+        req[7] = 0;              // center_ch2
+        put16(req + 8, 0);       // cac_case
+        req[10] = (ch > 14 ? 1 : 0); // channel_band (0: 2.4G, 1: 5G)
+        req[11] = 0;             // rsv0
+        put32(req + 12, 0);      // outband_freq
+        req[16] = 0;             // txpower_drop
+        req[17] = bw;            // ap_bw
+        req[18] = center;        // ap_center_ch
+
+        int sent = txSend(txMcu, msg, total);
+        if (sent < 0) return sent;
+        return mcuWait(0xed, seq);
+    }
+    return 0;
+}
+
 int WTLWireless::roc(bool acquire) {
     uint8_t req[4 + 24] = {};
     uint8_t *t = req + 4;
@@ -366,10 +623,21 @@ int WTLWireless::roc(bool acquire) {
         put16(t + 2, 24);
         t[4] = BSS_IDX;
         t[5] = rocTok;
+        uint8_t center = (chip && chip->id == 0x7902) ? tgtCh : (chCenter ? chCenter : tgtCh);
+        uint8_t sco = 0;
+        if (!(chip && chip->id == 0x7902)) {
+            if (tgtCh < center) sco = 1;        // SCA (Secondary Channel Above)
+            else if (tgtCh > center) sco = 3;   // SCB (Secondary Channel Below)
+        }
         t[6] = tgtCh;
-        t[8] = tgtCh > 14 ? 2 : 1;
-        t[10] = tgtCh;
-        t[13] = tgtCh;
+        t[7] = sco;                             // sco: 1 (SCA), 3 (SCB), or 0 (20MHz)
+        t[8] = tgtCh > 14 ? 2 : 1;              // band: 2 for 5GHz, 1 for 2.4GHz
+        t[9] = 0;                               // bw 20MHz
+        t[10] = center;                         // center_chan
+        t[11] = 0;
+        t[12] = 0;                              // bw_from_ap: 20MHz
+        t[13] = center;                         // center_chan_from_ap
+        t[14] = 0;
         t[15] = 0;                              // reqtype JOIN
         put32(t + 16, 5000);
         t[20] = 0xff;
@@ -383,6 +651,22 @@ int WTLWireless::roc(bool acquire) {
     return uniCmd(UNI_ROC, req, 4 + 12, false, nullptr, 0, nullptr);
 }
 
+// mt792x_mac_set_timeing (mt792x_mac.c): configure 2.4G vs 5G PLCP/CCA/SIFS/CFEND timing
+void WTLWireless::macSetTiming(uint8_t ch) {
+    bool is2g = ch <= 14;
+    uint32_t sifs = is2g ? 10u : 16u;
+    uint32_t slot = 9u;
+    uint32_t cck = (231u & 0xffffu) | ((48u & 0xffffu) << 16);
+    uint32_t ofdm = (60u & 0xffffu) | ((28u & 0xffffu) << 16);
+    rmw(0x820e3080, 0, (1u << 8) | (1u << 9));               // MT_ARB_SCR(0): TX_DISABLE | RX_DISABLE
+    IODelay(1);
+    wr(0x820e4090, cck);                                      // MT_TMAC_CDTR(0)
+    wr(0x820e4094, ofdm);                                     // MT_TMAC_ODTR(0)
+    wr(0x820e40a4, 360u | (2u << 10) | (sifs << 16) | (slot << 24)); // MT_TMAC_ICR0(0)
+    rmw(0x820e2084, 0x3fffu, 0x49u);                          // MT_AGG_ACR0(0): MT792x_CFEND_RATE_DEFAULT (OFDM 24M)
+    rmw(0x820e3080, (1u << 8) | (1u << 9), 0);                // re-enable TX & RX
+}
+
 // Fixed-rate table (idx 14..25: CCK 1/2/5.5/11, OFDM 6..54) and WTBL admission counters (m3HwPrep)
 void WTLWireless::hwPrep() {
     static const uint16_t rates[12] = {0, 1, 2, 3, (1 << 6) | 11, (1 << 6) | 15, (1 << 6) | 10, (1 << 6) | 14,
@@ -393,9 +677,12 @@ void WTLWireless::hwPrep() {
         wr(WTBL_ITCR, (1u << 16) | (1u << 31) | (uint32_t)(14 + i));
     }
     static const uint16_t wcids[2] = {BMC_WCID, AP_WCID};
+    uint32_t wtblReg = (chip && chip->id == 0x7902) ? 0x820d4230 : WTBL_UPDATE;
+    uint32_t clearBit = (chip && chip->id == 0x7902) ? (1u << 12) : (1u << 14);
+    uint32_t mask = (chip && chip->id == 0x7902) ? 0x3ff : 0xfff;
     for (int i = 0; i < 2; i++) {
-        rmw(WTBL_UPDATE, 0xfff | (1u << 14), wcids[i] | (1u << 14));
-        pollMsec(WTBL_UPDATE, 1u << 31, 0, 50, 1);
+        rmw(wtblReg, mask | clearBit, wcids[i] | clearBit);
+        pollMsec(wtblReg, 1u << 31, 0, 50, 1);
     }
 }
 
@@ -404,33 +691,56 @@ void WTLWireless::hwPrep() {
 // ht the HT and VHT capabilities of the MT7925 (mt7925/init.c, 2 streams, no beamforming, no A-MSDU above
 // 3839 bytes) plus the WMM information element.
 uint8_t *WTLWireless::assocIes(uint8_t *p, bool ht) {
-    uint16_t cap = tgtCh > 14 ? 0x0401 : 0x0421;
+    uint16_t cap = 0x0001;                      // ESS
     if (tgtRsn) cap |= 0x0010;                  // Privacy
+    if (tgtCap & 0x0020) cap |= 0x0020;         // Short Preamble
+    if (tgtCap & 0x0400) cap |= 0x0400;         // Short Slot Time
     put16(p, cap); p += 2;
-    put16(p, 10); p += 2;
+    put16(p, 10); p += 2;                       // Listen Interval
     uint8_t sl = tgtSsidLen;
     *p++ = 0; *p++ = sl; memcpy(p, tgtSsid, sl); p += sl;
-    static const uint8_t rates5[8] = {0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c};
-    static const uint8_t rates2[8] = {0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24};
-    static const uint8_t ext2[4] = {0x30, 0x48, 0x60, 0x6c};
-    *p++ = 1; *p++ = 8; memcpy(p, tgtCh > 14 ? rates5 : rates2, 8); p += 8;
-    if (tgtCh <= 14) { *p++ = 50; *p++ = 4; memcpy(p, ext2, 4); p += 4; }
+
+    // Echo the AP's exact Supported Rates and Extended Supported Rates from its beacon
+    const uint8_t *apRates = nullptr, *apExtRates = nullptr;
+    for (const uint8_t *ie = tgtIe, *end = tgtIe + tgtIeLen; ie + 2 <= end && ie + 2 + ie[1] <= end; ie += 2 + ie[1]) {
+        if (ie[0] == 1 && ie[1] <= 8) apRates = ie;
+        else if (ie[0] == 50) apExtRates = ie;
+    }
+    if (apRates) {
+        memcpy(p, apRates, (size_t)(2 + apRates[1]));
+        p += 2 + apRates[1];
+        if (apExtRates) {
+            memcpy(p, apExtRates, (size_t)(2 + apExtRates[1]));
+            p += 2 + apExtRates[1];
+        }
+    } else {
+        static const uint8_t rates5[8] = {0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c};
+        static const uint8_t rates2[8] = {0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24};
+        static const uint8_t ext2[4] = {0x30, 0x48, 0x60, 0x6c};
+        *p++ = 1; *p++ = 8; memcpy(p, tgtCh > 14 ? rates5 : rates2, 8); p += 8;
+        if (tgtCh <= 14) { *p++ = 50; *p++ = 4; memcpy(p, ext2, 4); p += 4; }
+    }
+
     if (tgtRsn) p += mtk_rsn_ie_psk(p, tgtGroup);
     if (!ht) return p;
     *p++ = 45; *p++ = 26;                       // HT Capabilities
     uint8_t *h = p;
     bzero(h, 26);
-    put16(h, 0x0001 | 0x0002 | 0x000c | 0x0020 | 0x0040 | 0x0100);  // LDPC, 20/40, SM PS off, SGI20/40, RX STBC 1
+    uint16_t htCap = 0x0001 | 0x000c | 0x0020 | 0x0100; // LDPC, SM PS off, SGI20, RX STBC 1
+    if (chBw) htCap |= 0x0002 | 0x0040;         // 20/40, SGI40
+    put16(h, htCap);
     h[2] = 0x03;                                // A-MPDU: 64 KB, no density restriction
-    h[3] = 0xff; h[4] = 0xff;                   // RX MCS 0-15
+    h[3] = 0xff;                                // RX MCS 0-7
+    h[4] = (nicNss > 1) ? 0xff : 0x00;          // RX MCS 8-15 only when 2 streams
     h[15] = 0x01;                               // TX MCS set defined
     p += 26;
-    if (apVht) {
+    if (apVht && tgtCh > 14) {
         *p++ = 191; *p++ = 12;                  // VHT Capabilities
+        uint16_t vhtMcs = (nicNss > 1) ? 0xfffa : 0xfffe;
         put32(p, 0x10 | 0x20 | 0x80 | 0x100 | (7u << 23));                // RXLDPC, SGI80, TX STBC, RX STBC 1, A-MPDU 1 MB
-        put16(p + 4, 0xfffa);                   // RX MCS 0-9, 2 streams
+        put16(p + 4, vhtMcs);                   // RX MCS 0-9, 1 or 2 streams
         put16(p + 6, 0);
-        put16(p + 8, 0xfffa);                   // TX MCS 0-9, 2 streams
+        put16(p + 8, vhtMcs);                   // TX MCS 0-9, 1 or 2 streams
         put16(p + 10, 0);
         p += 12;
     }
@@ -451,20 +761,35 @@ void WTLWireless::mgmtHeader(uint8_t *f, uint8_t fc0) {
 
 // Open-system authentication: algorithm 0, transaction 1. The response is caught by noteMgmt (wantFc 0xb0).
 void WTLWireless::sendAuth() {
+    rxFilterPromisc();
+    static uint16_t authSeq = 0;
+    authSeq = (authSeq + 1) & 0xfff;
     uint8_t f[30];
     mgmtHeader(f, 0xb0);
+    put16(f + 2, 0x013a);                       // Duration/ID: 314 us
+    put16(f + 22, (authSeq << 4));              // Sequence Control: seq in bits 15:4, frag 0
     put16(f + 24, 0); put16(f + 26, 1); put16(f + 28, 0);
     mgmtLen = 0;
     wantFc = 0xb0;
     if (txMgmt(f, 30, 11)) authTx++;
     joinTries++;
     joinPhaseEnd = ticks + JOIN_PHASE_TICKS;
+    setNum("MtkJoinRfcr", rr(rmacBase(0)));
+    setNum("MtkJoinMdpBnrcfr0", rr(mdpBnrcfr0(chip, 0)));
+    setNum("MtkJoinRocCh", tgtCh);
+    setNum("MtkJoinRocCenter", chCenter ? chCenter : tgtCh);
+    setNum("MtkJoinChBw", chBw);
 }
 
 // Association request (HT/VHT + WMM on the first pass when the AP offers HT, legacy on the second)
 void WTLWireless::sendAssoc() {
+    rxFilterPromisc();
+    static uint16_t assocSeq = 0;
+    assocSeq = (assocSeq + 1) & 0xfff;
     uint8_t f[320];
     mgmtHeader(f, 0x00);
+    put16(f + 2, 0x013a);                       // Duration/ID: 314 us
+    put16(f + 22, (assocSeq << 4));             // Sequence Control
     uint8_t *p = assocIes(f + 24, joinHtPass);
     mgmtLen = 0;
     wantFc = 0x10;
@@ -500,10 +825,14 @@ bool WTLWireless::joinStart(int idx) {
     mgmtLen = 0;
     parseAp();
     hwPrep();
+    rxFilterPromisc();
+    setNum("MtkW5ChanSwitch", (uint32_t)chanSwitch(tgtCh, chCenter, chBw));
+    if (chip && chip->id == 0x7902) macSetTiming(tgtCh);
     setNum("MtkW5ApRates", (uint32_t)apSupp << 8 | apBasic);
     setNum("MtkW5BssAdd", (uint32_t)bssInfo(false));
     setNum("MtkW5StaNone", (uint32_t)staRec(0, true, 0));
     setNum("MtkW5Roc", (uint32_t)roc(true));
+    rxFilterPromisc();
     rocHeld = true;
     joinHtPass = htOn && apHt;
     joinTries = 0;
@@ -533,6 +862,19 @@ void WTLWireless::joinService() {
         if ((int32_t)(ticks - joinDeadline) >= 0) joinFail(MTK_JOIN_ROC);
         return;
     case 2: {                                   // authentication
+        if ((ticks % 50) == 0) {
+            char dmaDiag[64];
+            snprintf(dmaDiag, sizeof(dmaDiag), "dma %u cpu %u frames %u tries %u",
+                     rawRead(rxData.regs + 12), rawRead(rxData.regs + 8), rxFrames, joinTries);
+            setProperty("MtkJoinDmaDiag", dmaDiag);
+            if (chip && chip->id == 0x7902) {
+                char macDiag[96];
+                snprintf(macDiag, sizeof(macDiag), "arb %08x icr %08x ple %08x,%08x tx %u/%u",
+                         rr(0x820e3080), rr(0x820e40a4), rr(0x820c0500), rr(0x820c0540),
+                         rawRead(txData.regs + 8), rawRead(txData.regs + 12));
+                setProperty("MtkJoinMacDiag", macDiag);
+            }
+        }
         if (mgmtLen) {
             uint16_t alg = le16(mgmt + 24), seq = le16(mgmt + 26), st = le16(mgmt + 28);
             mgmtLen = 0;
@@ -579,6 +921,7 @@ void WTLWireless::joinService() {
             }
             setNum("MtkW5BssUp", (uint32_t)bssInfo(true));
             setNum("MtkW5StaAssoc", (uint32_t)staRec(2, false, aid));
+            if (chip && chip->id == 0x7902) setNum("MtkW5StaBmc", (uint32_t)staBmcRec(true, aid));
             if (!tgtRsn) { roc(false); rocHeld = false; }   // WPA2: joinUp releases it (mt76 fddc43d)
             linkUp = true;
             joinedOnce = true;
@@ -862,6 +1205,11 @@ int WTLWireless::coreJoin(const mtk_join_params *p) {
     lastResult = MTK_JOIN_PENDING;
     if (joinState) switchPending = true;
     cmKick = true;
+    if (cmPick() < 0) {
+        lastResult = MTK_JOIN_PENDING;
+        scanWanted = true;
+        cmLastScanAt = 0;
+    }
     return 0;
 }
 

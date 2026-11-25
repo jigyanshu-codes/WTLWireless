@@ -25,6 +25,8 @@ grep -q "\"MtkBtVersion\", \"$V\"" src/bt/WTLWirelessBt.cpp || { echo "FAIL: Mtk
 NEED=$($PB -c 'Print :OSBundleLibraries:org.watchthelight.WTLWireless' src/native/Info.plist)
 [ "$NEED" = "$V" ] || { echo "FAIL: the native part asks for core $NEED, this is $V"; exit 1; }
 ABI=${ABI:-$(sw_vers -buildVersion)}
+ABI_MAJOR=${ABI%%[!0-9]*}
+[ -n "$ABI_MAJOR" ] || ABI_MAJOR=25
 if [ ! -d "abi/$ABI" ]; then
   echo "FAIL: no ABI headers in abi/$ABI. Shipped: $(ls abi | tr '\n' ' ')"
   echo "  Build against one of them (ABI=<build> ./build.sh): the native part then loads only where its allow-list matches"
@@ -95,7 +97,7 @@ fi
 echo "=== native ($ABI)"
 OBJS=""
 for s in MtkNativeTrace WTLWirelessNative WTLWirelessNativeIf WTLWirelessNativeReq; do
-  clang++ $CXXFLAGS -Iabi/$ABI -Isrc/core -Isrc/native -c src/native/$s.cpp -o out/obj/native/$s.o
+  clang++ $CXXFLAGS -DMTK_NATIVE_ABI_MAJOR=$ABI_MAJOR -Iabi/$ABI -Isrc/core -Isrc/native -c src/native/$s.cpp -o out/obj/native/$s.o
   OBJS="$OBJS out/obj/native/$s.o"
 done
 link native WTLWirelessNative $OBJS

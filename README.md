@@ -61,7 +61,8 @@ The upstream repo supports macOS Tahoe (26.x) builds. **This fork adds support f
    - `WTLWireless.kext` — `BundlePath: WTLWireless.kext`
    - `WTLWirelessNative.kext` — `BundlePath: WTLWireless.kext/Contents/PlugIns/WTLWirelessNative.kext`
 4. Add boot args: `mtk7902=1 mtkfe=native mtknativeif=1`
-5. Reboot
+5. **Important (ASUS Vivobook / NullMoth `1401` EFI users):** Disable `SSDT-Disable_Network_RP07.aml` (or any SSDT that disables the Wi-Fi PCIe slot) in `config.plist` → `ACPI` → `Add`, otherwise macOS will not see the MT7902 card.
+6. Reboot
 
 ### Build from Source
 
